@@ -451,13 +451,19 @@ thread_local CompilingNow g_compiling{};
 
 // Pipelines whose compile crashed the driver (FM4 port: AMD's amdxc64 faults on a few): written by
 // RendererLogCrashContext (the port's crash handler, through regpu::LogCrashContext) to regpu-bad-pipelines.txt
-// and refused on the next start, so a draw using one is dropped instead of killing the game.
+// and refused on the next start, so a draw using one is dropped instead of killing the game. The file is in
+// Config::userDir (the path is made on the first pipeline, so the crash handler doesn't allocate).
 const char* const kBadPipelinesFile = "regpu-bad-pipelines.txt";
+const std::wstring& BadPipelinesPath()
+{
+    static const std::wstring path = (regpu::GetConfig().userDir / kBadPipelinesFile).wstring();
+    return path;
+}
 bool PipelineIsPoisoned(uint64_t vs, uint64_t ps)
 {
     static const std::set<std::pair<uint64_t, uint64_t>> bad = [] {
         std::set<std::pair<uint64_t, uint64_t>> out;
-        if (FILE* f = fopen(kBadPipelinesFile, "r"))
+        if (FILE* f = _wfopen(BadPipelinesPath().c_str(), L"r"))
         {
             unsigned long long v, p;
             while (fscanf(f, "%llx %llx", &v, &p) == 2)
@@ -3222,6 +3228,34 @@ bool Rebuild(const char* line, uint64_t& hash, std::vector<uint32_t>& code)
 }
 }
 
+// A cache file written under a temporary name and renamed into place: a run killed mid-write (or one
+// reading the cache meanwhile) never finds half a file, which would load as a broken shader. The
+// temporary name is unique, so two threads storing the same file don't write into each other's.
+static bool WriteCacheFile(const std::filesystem::path& path, const void* data, size_t size)
+{
+    static std::atomic<uint32_t> serial{ 0 };
+    auto tmp = path;
+    tmp += "." + std::to_string(GetCurrentThreadId()) + "." + std::to_string(serial++) + ".tmp";
+    std::error_code ec;
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        out.write(static_cast<const char*>(data), std::streamsize(size));
+        out.close();
+        if (!out)
+        {
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec)
+    {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
 struct Manifest
 {
     std::mutex mutex;
@@ -3283,7 +3317,7 @@ struct Manifest
         g_diskWriter.Push([path = UcodePath(pixel, hash), code = codeBE, patch, hash] {
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
-                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(code.data()), std::streamsize(code.size() * 4));
+                WriteCacheFile(path, code.data(), code.size() * 4);
             if (patch)
                 if (const std::string line = VertexPatch::Line(hash, code); !line.empty())
                     std::ofstream(Path(), std::ios::app) << line << '\n';
@@ -3368,13 +3402,7 @@ struct ShaderOptimizer
                     job.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
                     &code, &errors)))
                 continue; // the unoptimised build stays
-            // Written under a temporary name: a run that reads it never sees half a file.
-            const auto path = ShaderCachePath(job.key, true);
-            auto tmp = path;
-            tmp += ".tmp";
-            std::ofstream(tmp, std::ios::binary).write(static_cast<const char*>(code->GetBufferPointer()), std::streamsize(code->GetBufferSize()));
-            std::error_code ec;
-            std::filesystem::rename(tmp, path, ec);
+            WriteCacheFile(ShaderCachePath(job.key, true), code->GetBufferPointer(), code->GetBufferSize());
             if (const uint32_t n = ++built; n == 1 || n % 100 == 0)
                 Log("renderer: %u shaders optimised in the background", n);
         }
@@ -3525,8 +3553,7 @@ struct ShaderCompiler
         g_stats.shadersBuilt++;
         if (ms > 200)
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
-        std::ofstream(ShaderCachePath(cs.cacheKey), std::ios::binary)
-            .write(static_cast<const char*>(cs.code->GetBufferPointer()), std::streamsize(cs.code->GetBufferSize()));
+        WriteCacheFile(ShaderCachePath(cs.cacheKey), cs.code->GetBufferPointer(), cs.code->GetBufferSize());
         if (g_optimizeShaders)
             g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         cs.state.store(CompiledShader::Ready, std::memory_order_release);
@@ -7780,7 +7807,7 @@ void RendererLogCrashContext()
     }
     Log("crash: this thread was inside the driver compiling pipeline vs %016llx ps %016llx; it will be skipped on the next start",
         (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
-    if (FILE* f = fopen(kBadPipelinesFile, "a"))
+    if (FILE* f = _wfopen(BadPipelinesPath().c_str(), L"a"))
     {
         fprintf(f, "%016llx %016llx\n", (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
         fclose(f);
@@ -9792,6 +9819,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     memset(vc->vuser, 0, sizeof(vc->vuser));
     if (const auto onDraw = regpu::GetHost().onDraw; onDraw && (vs.tag || ps.tag))
         onDraw(C().vsHash, C().psHash, vs.tag, ps.tag, vc->c, vc->vuser);
+    float clearColour[4] = {};
+    const auto clearBeforeDraw = regpu::GetHost().clearBeforeDraw;
+    const bool clearBefore = clearBeforeDraw && (vs.tag || ps.tag) && clearBeforeDraw(C().vsHash, C().psHash, vs.tag, ps.tag, clearColour);
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
@@ -9948,6 +9978,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (!clamp && !oldClamp)
             ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+        // The mirroring modes (1 mirrored repeat; 3, 5, 7 mirrored once, then clamped): the shader folds
+        // the coordinate (bits 28 U, 29 V; 30, 31 once). Taken as plain clamps, FH1's wrong-way sign came
+        // out blank: its arrow is the mirror image of an atlas icon, fetched at u -0.835..-0.668 with U
+        // mirrored, and clamped to the transparent edge texel. REGPU_NO_MIRROR=1: as clamps (A/B).
+        if (static LiveSwitch noMirror("REGPU_NO_MIRROR"); !noMirror)
+        {
+            const auto mirror = [](uint32_t mode, uint32_t bit, uint32_t onceBit) {
+                return mode == 1 ? bit : (mode == 3 || mode == 5 || mode == 7) ? bit | onceBit : 0u;
+            };
+            ti[0] |= mirror(clampX, 1u << 28, 1u << 30) | mirror(clampY, 1u << 29, 1u << 31);
+        }
         // Anisotropy the fetch asks for (dword 3 bits 25-27: 2 = 2x .. 5 = 16x), for the linear wrapping
         // sampler: bits 20-22 pick s4-s7 (hlsl.cpp). Only with REGPU_ANISO_FROM_FETCH (else s0 is 16x).
         if (const uint32_t aniso = (fetch.dwords[3] >> 25) & 7; AnisoFromFetch() && !point && !clamp && aniso >= 2 && aniso <= 5)
@@ -10165,6 +10206,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ds.stencilRef = ref;
         C().list->OMSetStencilRef(ref);
     }
+    // The game asked for the colour target to be cleared before this draw (Host::clearBeforeDraw).
+    if (clearBefore)
+        C().list->ClearRenderTargetView(C().rtv, clearColour, 1, &hostScissor);
     {
         // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.
         const float factor[4] = { RegFloat(0x2105), RegFloat(0x2106), RegFloat(0x2107), RegFloat(0x2108) };
