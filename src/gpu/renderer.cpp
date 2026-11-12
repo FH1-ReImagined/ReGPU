@@ -409,6 +409,7 @@ struct ResolvedTexture
     bool stale = false;
     uint32_t guestBpp = 4; // bytes per pixel of the guest image: the hash covers only its memory
     uint32_t guestFormat = 0; // the copy's destination format (RB_COPY_DEST_INFO bits 7-12)
+    bool plain8888 = false; // copied from a k_8_8_8_8 surface to a k_8_8_8_8 image: its bytes aren't gamma (see the gamma-signed fetches)
     // The title resolves differently sized images (bloom chain) to one address within a
     // frame: keep earlier sizes here and swap them in rather than recreating them.
     std::vector<ResolvedTexture> spares;
@@ -451,13 +452,19 @@ thread_local CompilingNow g_compiling{};
 
 // Pipelines whose compile crashed the driver (FM4 port: AMD's amdxc64 faults on a few): written by
 // RendererLogCrashContext (the port's crash handler, through regpu::LogCrashContext) to regpu-bad-pipelines.txt
-// and refused on the next start, so a draw using one is dropped instead of killing the game.
+// and refused on the next start, so a draw using one is dropped instead of killing the game. The file is in
+// Config::userDir (the path is made on the first pipeline, so the crash handler doesn't allocate).
 const char* const kBadPipelinesFile = "regpu-bad-pipelines.txt";
+const std::wstring& BadPipelinesPath()
+{
+    static const std::wstring path = (regpu::GetConfig().userDir / kBadPipelinesFile).wstring();
+    return path;
+}
 bool PipelineIsPoisoned(uint64_t vs, uint64_t ps)
 {
     static const std::set<std::pair<uint64_t, uint64_t>> bad = [] {
         std::set<std::pair<uint64_t, uint64_t>> out;
-        if (FILE* f = fopen(kBadPipelinesFile, "r"))
+        if (FILE* f = _wfopen(BadPipelinesPath().c_str(), L"r"))
         {
             unsigned long long v, p;
             while (fscanf(f, "%llx %llx", &v, &p) == 2)
@@ -1545,7 +1552,7 @@ void InitDepthBlit()
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 6;
+    params[1].Constants.Num32BitValues = 7;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 2;
@@ -1559,7 +1566,8 @@ void InitDepthBlit()
     static const char kSource[] = R"(
 Texture2D<float> depthTex : register(t0);
 Texture2D<float4> colorTex : register(t0);
-cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; };
+// srcRow: the surface row the image's first written row comes from (a band of a taller image, BlitResolve).
+cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; int srcRow; };
 // Xenia's LinearToPWLGamma: what a k_8_8_8_8_GAMMA surface holds in memory.
 float LinearToPWLGamma(float l)
 {
@@ -1584,7 +1592,7 @@ float4 vs(uint id : SV_VertexID) : SV_Position
 }
 float ps(float4 pos : SV_Position) : SV_Target
 {
-    return depthTex.Load(int3(int2(pos.xy), 0));
+    return depthTex.Load(int3(int2(pos.x, pos.y - srcRow), 0));
 }
 Texture2D<uint2> stencilTex : register(t1);
 // 20e4 (D24FS8): 4-bit exponent biased by 15, 20-bit mantissa, [0, 2).
@@ -1599,14 +1607,14 @@ uint Encode20e4(float v)
 }
 float4 psPack(float4 pos : SV_Position) : SV_Target
 {
-    float z = depthTex.Load(int3(int2(pos.xy), 0));
-    uint st = stencilTex.Load(int3(int2(pos.xy), 0)).g;
+    float z = depthTex.Load(int3(int2(pos.x, pos.y - srcRow), 0));
+    uint st = stencilTex.Load(int3(int2(pos.x, pos.y - srcRow), 0)).g;
     uint d = swapRB != 0 ? Encode20e4(z) : uint(round(saturate(z) * 16777215.0));
     return float4(float(st & 0xFFu), float(d & 0xFFu), float((d >> 8) & 0xFFu), float(d >> 16)) / 255.0;
 }
 float4 psColor(float4 pos : SV_Position) : SV_Target
 {
-    float4 c = colorTex.Load(int3(int2(pos.xy), 0)) * scale;
+    float4 c = colorTex.Load(int3(int2(pos.x, pos.y - srcRow), 0)) * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
     if (toGamma & 1u) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
     if (toGamma & 2u) c.a = round(saturate(c.a) * 3.0) / 3.0; // a 2-bit alpha destination (k_2_10_10_10)
@@ -1653,7 +1661,8 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
         const std::string msSource = "#define SAMPLES " + std::to_string(g_msaa) + R"(
 Texture2DMS<float, SAMPLES> depthMs : register(t0);
 Texture2DMS<float4, SAMPLES> colorMs : register(t0);
-cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; };
+// srcRow: the surface row the image's first written row comes from (a band of a taller image, BlitResolve).
+cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; int srcRow; };
 // Xenia's LinearToPWLGamma: what a k_8_8_8_8_GAMMA surface holds in memory.
 float LinearToPWLGamma(float l)
 {
@@ -1678,13 +1687,13 @@ float4 vs(uint id : SV_VertexID) : SV_Position
 }
 float ps(float4 pos : SV_Position) : SV_Target
 {
-    return depthMs.Load(int2(pos.xy), 0);
+    return depthMs.Load(int2(pos.x, pos.y - srcRow), 0);
 }
 float4 psColor(float4 pos : SV_Position) : SV_Target
 {
     float4 c = 0;
     [unroll] for (int i = 0; i < SAMPLES; i++)
-        c += colorMs.Load(int2(pos.xy), i);
+        c += colorMs.Load(int2(pos.x, pos.y - srcRow), i);
     c = c / SAMPLES * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
     if (toGamma & 1u) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
@@ -3222,6 +3231,34 @@ bool Rebuild(const char* line, uint64_t& hash, std::vector<uint32_t>& code)
 }
 }
 
+// A cache file written under a temporary name and renamed into place: a run killed mid-write (or one
+// reading the cache meanwhile) never finds half a file, which would load as a broken shader. The
+// temporary name is unique, so two threads storing the same file don't write into each other's.
+static bool WriteCacheFile(const std::filesystem::path& path, const void* data, size_t size)
+{
+    static std::atomic<uint32_t> serial{ 0 };
+    auto tmp = path;
+    tmp += "." + std::to_string(GetCurrentThreadId()) + "." + std::to_string(serial++) + ".tmp";
+    std::error_code ec;
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        out.write(static_cast<const char*>(data), std::streamsize(size));
+        out.close();
+        if (!out)
+        {
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec)
+    {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
 struct Manifest
 {
     std::mutex mutex;
@@ -3283,7 +3320,7 @@ struct Manifest
         g_diskWriter.Push([path = UcodePath(pixel, hash), code = codeBE, patch, hash] {
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
-                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(code.data()), std::streamsize(code.size() * 4));
+                WriteCacheFile(path, code.data(), code.size() * 4);
             if (patch)
                 if (const std::string line = VertexPatch::Line(hash, code); !line.empty())
                     std::ofstream(Path(), std::ios::app) << line << '\n';
@@ -3368,13 +3405,7 @@ struct ShaderOptimizer
                     job.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
                     &code, &errors)))
                 continue; // the unoptimised build stays
-            // Written under a temporary name: a run that reads it never sees half a file.
-            const auto path = ShaderCachePath(job.key, true);
-            auto tmp = path;
-            tmp += ".tmp";
-            std::ofstream(tmp, std::ios::binary).write(static_cast<const char*>(code->GetBufferPointer()), std::streamsize(code->GetBufferSize()));
-            std::error_code ec;
-            std::filesystem::rename(tmp, path, ec);
+            WriteCacheFile(ShaderCachePath(job.key, true), code->GetBufferPointer(), code->GetBufferSize());
             if (const uint32_t n = ++built; n == 1 || n % 100 == 0)
                 Log("renderer: %u shaders optimised in the background", n);
         }
@@ -3525,8 +3556,7 @@ struct ShaderCompiler
         g_stats.shadersBuilt++;
         if (ms > 200)
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
-        std::ofstream(ShaderCachePath(cs.cacheKey), std::ios::binary)
-            .write(static_cast<const char*>(cs.code->GetBufferPointer()), std::streamsize(cs.code->GetBufferSize()));
+        WriteCacheFile(ShaderCachePath(cs.cacheKey), cs.code->GetBufferPointer(), cs.code->GetBufferSize());
         if (g_optimizeShaders)
             g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         cs.state.store(CompiledShader::Ready, std::memory_order_release);
@@ -4560,7 +4590,11 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     g_waitWhat = depthOnly ? "pipeline (depth only)" : "pipeline";
     g_waitBlend = key.blend;
     const auto waitStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ID3D12PipelineState* pso = WaitForPipeline(entry, PlainRectMustDraw());
+    // A draw that gets here unbuilt was judged unskippable above, so it waits even with REGPU_ASYNC_PIPELINES
+    // (without this, async dropped opaque one-time draws too: a render-to-texture that runs once, such as a
+    // baked texture, stayed black for good). REGPU_ASYNC_DROP_UNSKIPPABLE=1: dropped, as before.
+    static LiveSwitch dropUnskippable("REGPU_ASYNC_DROP_UNSKIPPABLE");
+    ID3D12PipelineState* pso = WaitForPipeline(entry, PlainRectMustDraw() || !dropUnskippable);
     if (g_perfTiming)
         if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(); ms > 2.0)
             Log("perf: GetPipeline waited %.1f ms for pipeline %016llx/%016llx (state was %d)", ms, (unsigned long long)key.vs, (unsigned long long)key.ps, 0);
@@ -5971,9 +6005,10 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
 }
 
 // destRange: the destination's fixed-point range after the scale (the 16-bit integer range for the
-// 16-bit fixed formats); null none.
+// 16-bit fixed formats); null none. destRow: the image row the surface's rect lands at (0: its own
+// row; a band of a taller image lands destRow rows down).
 void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
-    const float* destRange = nullptr, uint32_t toGamma = 0)
+    const float* destRange = nullptr, uint32_t toGamma = 0, LONG destRow = 0)
 {
     // REGPU_FREEZE_RESOLVES=<hex base>[,<hex base>...]: those images keep what they hold, later resolves
     // to them are skipped (debug: does a flicker come from an image's redraws?). Read every resolve, so
@@ -6017,7 +6052,8 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
         NoteResolvedMemory(base, dest);
     dest.frame = g_r.frame;
     dest.serial = ++g_resolveSerial;
-    const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
+    // The image rectangle written (the surface's rect, destRow rows down).
+    const D3D12_RECT sr{ rect.left, rect.top + destRow, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom + destRow, height) };
     FrameResources& f = Frame();
     if (sr.right <= sr.left || sr.bottom <= sr.top || f.descriptorsUsed >= kDescriptorsPerFrame)
         return;
@@ -6058,9 +6094,10 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
     C().list->SetPipelineState(pso);
     C().list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
-    const uint32_t blitConstants[6] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB), uint32_t(destRange != nullptr),
-        std::bit_cast<uint32_t>(destRange ? destRange[0] : 0.0f), std::bit_cast<uint32_t>(destRange ? destRange[1] : 0.0f), uint32_t(toGamma) };
-    C().list->SetGraphicsRoot32BitConstants(1, 6, blitConstants, 0);
+    const uint32_t blitConstants[7] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB), uint32_t(destRange != nullptr),
+        std::bit_cast<uint32_t>(destRange ? destRange[0] : 0.0f), std::bit_cast<uint32_t>(destRange ? destRange[1] : 0.0f), uint32_t(toGamma),
+        uint32_t(HostY(destRow)) };
+    C().list->SetGraphicsRoot32BitConstants(1, 7, blitConstants, 0);
     // Width and height stay in game pixels (the size the title knows); the texture and the
     // rectangle are scaled.
     const D3D12_VIEWPORT vp{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 };
@@ -6898,8 +6935,8 @@ void Resolve()
         // (Only for a rectangle narrower than the image: full-width rows are a tall pass's tiles, which
         // FH1's scene resolves are too, at the tile's own row.)
         const bool placedInImage = imageBase && rect.top > 0 && uint32_t(rect.bottom) <= declaredHeight && uint32_t(rect.right - rect.left) < pitch;
-        const uint32_t base = placedInImage ? gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF
-                                            : ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp)) & 0x1FFFFFFF;
+        const uint32_t destBase = gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF;
+        uint32_t base = placedInImage ? destBase : (destBase - uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp)) & 0x1FFFFFFF;
         const uint32_t width = std::clamp<uint32_t>(pitch, 1, std::max<uint32_t>(kWidth, BigPassSize()));
         // Taller than the screen is possible: a 1024x1024 target drawn as tall passes is resolved
         // 720 rows at a time and sampled as 1024 rows. The texture keeps all its rows (clamped to
@@ -6928,6 +6965,60 @@ void Resolve()
         // Bit 24 (copy swap): the destination stores red and blue exchanged; the
         // fetch swizzle swaps them back when the title samples it.
         const bool swapRB = !depth && ((info >> 24) & 1);
+        // A copy to a row of an image resolved this frame or the last (its pitch, its format, the
+        // rectangle at the origin) is a band of that image: a target taller than the EDRAM holds is drawn
+        // and copied a band at a time, each to its own rows (FH1's paint job: each side's 598 rows in
+        // three bands of 224, then the sides into its 1024x1024 layout). Keyed by its own address each
+        // band was an image of its own, and a fetch of the whole image (at its base) saw only what was
+        // copied there: the layout came out empty, and the car had no paint job. The band is blitted into
+        // the image at its row (BlitResolve's destRow). REGPU_NO_RESOLVE_BANDS=1: as before (A/B).
+        static LiveSwitch noBands("REGPU_NO_RESOLVE_BANDS");
+        LONG destRow = 0;
+        // (A zero pitch has no rows to find a band in: the copy stays an image of its own, as before.)
+        if (!noBands && !placedInImage && rect.top == 0 && rect.bottom > 0 && pitch != 0)
+        {
+            const uint32_t rowBytes = pitch * guestBpp;
+            // Every image the destination is a row of. Two can hold it (images that overlap in memory,
+            // one inside the other's rows); the map's order between them is arbitrary, so the band goes to
+            // the one only when it is the image the previous resolve wrote (the band before this one, or
+            // the image itself): bands of one target are copied one after another. Otherwise it is
+            // ambiguous and the copy stays an image of its own, as before.
+            struct Band
+            {
+                uint32_t base = 0, row = 0;
+                const ResolvedTexture* image = nullptr;
+            } any, last;
+            uint32_t candidates = 0;
+            for (const auto& [imageBase, image] : g_r.resolved)
+            {
+                if (!image.resource || imageBase >= destBase || image.width != width || image.format != format || image.frame == ~0ull ||
+                    image.frame + 2 < g_r.frame || (destBase - imageBase) % rowBytes != 0)
+                    continue;
+                // (A band may overhang the image by a few rows, into the tile padding after it: FH1's
+                // 598-row sides copy 3 x 224 rows. The blit clips it.)
+                const uint32_t row = (destBase - imageBase) / rowBytes;
+                if (row >= image.height)
+                    continue;
+                candidates++;
+                any = { imageBase, row, &image };
+                if (image.serial == g_resolveSerial)
+                    last = any;
+            }
+            if (candidates > 1 && RendererTracing())
+                Log("resolve: %08X is a row of %u recent images: %s", destBase, candidates,
+                    last.image ? "the band goes to the one resolved last" : "ambiguous, kept as an image of its own");
+            if (const Band band = candidates == 1 ? any : last; band.image)
+            {
+                if (RendererTracing())
+                    Log("resolve: %08X is rows %u-%u of the %ux%u image at %08X", destBase, band.row, band.row + uint32_t(rect.bottom), band.image->width,
+                        band.image->height, band.base);
+                base = band.base;
+                height = band.image->height;
+                destRow = LONG(band.row);
+            }
+        }
+        // The band's rows in the image (what the write-backs copy).
+        const D3D12_RECT imageRect{ rect.left, rect.top + destRow, rect.right, rect.bottom + destRow };
         g_r.resolved[base].guestBpp = guestBpp;
         // 16-bit fixed destinations (k_16, k_16_16, k_16_16_16_16: formats 24-26) hold integers: the copy converts
         // each value (after the exponent bias) to a 16-bit integer and saturates, signed or unsigned by the copy's
@@ -6965,7 +7056,7 @@ void Resolve()
         // centre's), so the copy rounds it as the hardware's does. REGPU_NO_RESOLVE_ALPHA2=1: as before.
         static LiveSwitch noAlpha2("REGPU_NO_RESOLVE_ALPHA2");
         const uint32_t blitFlags = (toGamma ? 1u : 0u) | (!depth && destFormat == 7 && !noAlpha2 ? 2u : 0u);
-        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags);
+        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags, destRow);
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
         if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
             CopySceneDepth(rect);
@@ -6974,13 +7065,15 @@ void Resolve()
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
         g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
+        g_r.resolved[base].plain8888 = !depth && destFormat == 6 && ((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF) == 0;
         // Images the game reads on the CPU are also written to memory (regpu.h Host::resolveWriteback;
         // without it, REGPU_RESOLVE_WRITEBACK's "WxH,WxH" sizes of 8888 colour, at once).
         regpu::Writeback request;
         if (const auto ask = regpu::GetHost().resolveWriteback)
         {
             const uint32_t msaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
-            request = ask({ base, width, height, destFormat, depth, msaa == 2 ? 4u : msaa == 1 ? 2u : 1u, int32_t(rect.top), int32_t(rect.bottom) });
+            // (A band is keyed by its own address, so each is asked about; the copy covers its rows of the image.)
+            request = ask({ destRow ? destBase : base, width, height, destFormat, depth, msaa == 2 ? 4u : msaa == 1 ? 2u : 1u, int32_t(imageRect.top), int32_t(imageRect.bottom) });
         }
         else
         {
@@ -7012,7 +7105,7 @@ void Resolve()
         if (request.mode == regpu::Writeback::Mode::Now && !depth && anyFormat)
             WriteResolveToGuest(base, width, height, info);
         else if (request.mode == regpu::Writeback::Mode::Deferred && (depth || anyFormat))
-            QueueDeferredWriteback(base, width, height, info, depth, rect, request);
+            QueueDeferredWriteback(base, width, height, info, depth, imageRect, request);
     }
     // Clears after a tile's resolve prepare the EDRAM for the next tile, which
     // we draw lower on the same host surface: a full-width clear covers every
@@ -7780,7 +7873,7 @@ void RendererLogCrashContext()
     }
     Log("crash: this thread was inside the driver compiling pipeline vs %016llx ps %016llx; it will be skipped on the next start",
         (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
-    if (FILE* f = fopen(kBadPipelinesFile, "a"))
+    if (FILE* f = _wfopen(BadPipelinesPath().c_str(), L"a"))
     {
         fprintf(f, "%016llx %016llx\n", (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
         fclose(f);
@@ -9792,6 +9885,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     memset(vc->vuser, 0, sizeof(vc->vuser));
     if (const auto onDraw = regpu::GetHost().onDraw; onDraw && (vs.tag || ps.tag))
         onDraw(C().vsHash, C().psHash, vs.tag, ps.tag, vc->c, vc->vuser);
+    float clearColour[4] = {};
+    const auto clearBeforeDraw = regpu::GetHost().clearBeforeDraw;
+    const bool clearBefore = clearBeforeDraw && (vs.tag || ps.tag) && clearBeforeDraw(C().vsHash, C().psHash, vs.tag, ps.tag, clearColour);
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
@@ -9944,10 +10040,27 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if (sel < 4 && ((fetch.dwords[0] >> (2 + 2 * sel)) & 3) == 3)
                     gammaMask |= 1u << c;
             }
+            // A gamma-signed fetch of an image copied from a plain k_8_8_8_8 surface reads it as it is. FH1's menu
+            // videos draw to one and grade it with such a fetch: decoded, their dark half came out far below stock's
+            // (FH1R #685), and cancelling the decode matched stock's curve. REGPU_PLAIN_RESOLVE_GAMMA=1: decoded.
+            static LiveSwitch plainGamma("REGPU_PLAIN_RESOLVE_GAMMA");
+            if (resolvedPtr && resolvedPtr->plain8888 && !plainGamma)
+                gammaMask = 0;
             ti[0] |= gammaMask << 24;
         }
         if (!clamp && !oldClamp)
             ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+        // The mirroring modes (1 mirrored repeat; 3, 5, 7 mirrored once, then clamped): the shader folds
+        // the coordinate (bits 28 U, 29 V; 30, 31 once). Taken as plain clamps, FH1's wrong-way sign came
+        // out blank: its arrow is the mirror image of an atlas icon, fetched at u -0.835..-0.668 with U
+        // mirrored, and clamped to the transparent edge texel. REGPU_NO_MIRROR=1: as clamps (A/B).
+        if (static LiveSwitch noMirror("REGPU_NO_MIRROR"); !noMirror)
+        {
+            const auto mirror = [](uint32_t mode, uint32_t bit, uint32_t onceBit) {
+                return mode == 1 ? bit : (mode == 3 || mode == 5 || mode == 7) ? bit | onceBit : 0u;
+            };
+            ti[0] |= mirror(clampX, 1u << 28, 1u << 30) | mirror(clampY, 1u << 29, 1u << 31);
+        }
         // Anisotropy the fetch asks for (dword 3 bits 25-27: 2 = 2x .. 5 = 16x), for the linear wrapping
         // sampler: bits 20-22 pick s4-s7 (hlsl.cpp). Only with REGPU_ANISO_FROM_FETCH (else s0 is 16x).
         if (const uint32_t aniso = (fetch.dwords[3] >> 25) & 7; AnisoFromFetch() && !point && !clamp && aniso >= 2 && aniso <= 5)
@@ -10164,6 +10277,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         ds.stencilRef = ref;
         C().list->OMSetStencilRef(ref);
+    }
+    // The game asked for the colour target to be cleared before this draw (Host::clearBeforeDraw).
+    if (clearBefore)
+        C().list->ClearRenderTargetView(C().rtv, clearColour, 1, &hostScissor);
+    // The EDRAM is one memory: a depth-only draw (mode 5) writing depth and stencil FF at the colour
+    // surface's own base leaves its tiles reading white as colour. FH1 starts its night light buffer
+    // this way (a rectangle at depth 1): left black, every pixel decoded as full light.
+    // REGPU_NO_ALIASED_DEPTH_FILL=1: colour keeps its contents (A/B).
+    {
+        static LiveSwitch noAliasedFill("REGPU_NO_ALIASED_DEPTH_FILL");
+        const uint32_t depthControl = gpureg::Get(RB_DEPTHCONTROL);
+        if (!noAliasedFill && (gpureg::Get(RB_MODECONTROL) & 7) == 5 && (depthControl & 7) == 7 && ((depthControl >> 4) & 7) == 7 &&
+            (gpureg::Get(RB_STENCILREFMASK) & 0xFF) == 0xFF && ((gpureg::Get(RB_COLOR_INFO) ^ gpureg::Get(RB_DEPTH_INFO)) & 0xFFF) == 0)
+        {
+            const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            C().list->ClearRenderTargetView(C().rtv, white, 1, &hostScissor);
+        }
     }
     {
         // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.

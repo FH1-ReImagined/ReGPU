@@ -29,7 +29,7 @@ struct Config
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1
-    std::filesystem::path userDir = "."; // shader and pipeline caches, dumps
+    std::filesystem::path userDir = "."; // shader and pipeline caches, dumps, regpu.log, regpu-bad-pipelines.txt
     std::wstring windowTitle = L"ReGPU";
     // A window the host already owns (an HWND): ReGPU presents into it instead of opening its own.
     // The host then handles closing, resizing and fullscreen; windowTitle and fullscreen are unused.
@@ -125,6 +125,11 @@ struct Host
     // shader's constants (as the title set them); `user` is four float4 the rewritten shaders can read
     // as vuser[0..3] (zero unless set here).
     void (*onDraw)(uint64_t vs, uint64_t ps, uint32_t vsTag, uint32_t psTag, const float c[256][4], float user[4][4]) = nullptr;
+    // Optional: a draw with a tagged shader, before it is recorded: true clears the bound colour target
+    // over the draw's scissor to `colour` first. For pixels a title leaves unwritten and reads back, which
+    // on the console hold whatever another view of the same EDRAM left there (a depth surface, say), and
+    // here hold the colour surface's previous contents.
+    bool (*clearBeforeDraw)(uint64_t vs, uint64_t ps, uint32_t vsTag, uint32_t psTag, float colour[4]) = nullptr;
     // Optional: each frame the game finishes (VdSwap), on the renderer's thread.
     void (*onSwap)(uint64_t frame) = nullptr;
     // Optional: a character typed into the game window (WM_CHAR), e.g. for cheat codes.
@@ -161,7 +166,7 @@ bool WindowHasFocus();
 void LogState();
 // Call from the game's crash handler, on the crashing thread: if it crashed inside the graphics driver's
 // pipeline compiler (some drivers fault on a few pipelines), the pipeline is logged and refused from the
-// next start on (regpu-bad-pipelines.txt in the working directory), so its draws are dropped instead.
+// next start on (regpu-bad-pipelines.txt in Config::userDir), so its draws are dropped instead.
 // It also writes out the log lines still queued (REGPU_LOG_ASYNC).
 void LogCrashContext();
 
