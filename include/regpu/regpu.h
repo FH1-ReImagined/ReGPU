@@ -108,7 +108,9 @@ struct Host
     // stencilMaskMode flags [biasScale biasOffset]" in hex, one a line: hashes and render state, no game
     // data), typically merged from players' manifests. Those not built yet are built once, after the static
     // shaders, with the boot screen up; those needing a shader the game makes at run time are built in the
-    // background once it exists. Built ones join pipelines.manifest. REGPU_NO_SEED_PIPELINES=1 skips it.
+    // background once it exists. K2 rows use the same columns for independently keyed depth clipping.
+    // Legacy P rows with the former ambiguous clip/motion bit are rebuilt on demand.
+    // Built ones join pipelines.manifest. REGPU_NO_SEED_PIPELINES=1 skips it.
     const char* (*pipelineSeed)() = nullptr;
     // Optional: a 1280x720 RGBA8 screen for the first-boot shader compile (title, progress done/total;
     // total 0 while searching). False: ReGPU's plain progress overlay is shown instead.

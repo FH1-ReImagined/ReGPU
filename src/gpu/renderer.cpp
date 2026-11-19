@@ -44,6 +44,7 @@
 #include "live_switch.h"
 #include "settings.h"
 #include "gpu/regs.h"
+#include "gpu/pipeline_key.h"
 #include "gpu/texture.h"
 #include "gpu/ucode.h"
 #include "kernel/runtime.h"
@@ -478,13 +479,7 @@ bool PipelineIsPoisoned(uint64_t vs, uint64_t ps)
     return bad.count({ vs, ps }) != 0;
 }
 
-struct PipelineKey
-{
-    uint64_t vs, ps;
-    uint32_t blend, depth, stencilMaskMode, flags;
-    uint32_t biasScale = 0, biasOffset = 0; // polygon offset (float bits), 0 when off
-    bool operator==(const PipelineKey&) const = default;
-};
+using PipelineKey = regpu::pipeline::Key;
 // A polygon offset (float bits) rounded to 4 mantissa bits (within 3%): pipelines keyed by it. PGR4
 // moves one pass's offset a little every frame (1.5e-4 to 2.3e-4), and each value was a new pipeline,
 // built while the frame waited: 22,000 of the FX's 23,000 cached pipelines were that one shader pair.
@@ -3287,12 +3282,8 @@ struct Manifest
                 continue;
             }
             PipelineKey k{};
-            unsigned long long vs, ps;
-            // (Older manifests end at the flags: no polygon offset.)
-            if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x", &vs, &ps, &k.blend, &k.depth, &k.stencilMaskMode, &k.flags, &k.biasScale, &k.biasOffset) >= 6)
+            if (regpu::pipeline::ParseBasePipeline(line.c_str(), k))
             {
-                k.vs = vs;
-                k.ps = ps;
                 k.biasOffset = RoundedBias(k.biasOffset);
                 if (known.insert(k).second)
                     pending.push_back(k);
@@ -3307,7 +3298,7 @@ struct Manifest
         if (!known.insert(k).second)
             return;
         g_diskWriter.Push([k] {
-            std::ofstream(Path(), std::ios::app) << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' '
+            std::ofstream(Path(), std::ios::app) << regpu::pipeline::ManifestPrefix(k.flags) << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' '
                                                   << k.stencilMaskMode << ' ' << k.flags << ' ' << k.biasScale << ' ' << k.biasOffset << '\n';
         });
     }
@@ -4123,7 +4114,7 @@ struct PipelineLibrary
             code = (code ^ Fnv(misc, sizeof(misc), 9)) * 0x9E3779B97F4A7C15ull;
         }
         wchar_t name[128];
-        swprintf(name, 128, L"%016llx_%016llx_%08x_%08x_%08x_%08x_%016llx", (unsigned long long)k.vs, (unsigned long long)k.ps, k.blend, k.depth,
+        swprintf(name, 128, L"%ls%016llx_%016llx_%08x_%08x_%08x_%08x_%016llx", regpu::pipeline::LibraryPrefix(k.flags), (unsigned long long)k.vs, (unsigned long long)k.ps, k.blend, k.depth,
             k.stencilMaskMode, k.flags, (unsigned long long)code);
         return name;
     }
@@ -4330,7 +4321,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = (key.flags >> 2) & 1 ? FALSE : TRUE;
+    pd.RasterizerState.DepthClipEnable = !(key.flags & regpu::pipeline::kNoDepthClip);
     if (key.biasScale | key.biasOffset)
     {
         float scale, offset;
@@ -4386,7 +4377,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.SampleDesc.Count = g_msaa;
-    const bool motion = key.flags & 4; // motion-vector variants: a second target for the motion
+    const bool motion = key.flags & regpu::pipeline::kMotion; // motion-vector variants: a second target for the motion
     if (motion)
     {
         pd.pRootSignature = g_r.motionRootSignature.Get();
@@ -4497,7 +4488,7 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
         memcpy(&biasOffset, &v, 4);
     }
     PipelineKey key{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
-        uint32_t(alphaToMask) | (uint32_t(cullable) << 1) | (uint32_t(noDepthClip) << 2) };
+        uint32_t(alphaToMask) | (uint32_t(cullable) << 1) | (noDepthClip ? regpu::pipeline::kNoDepthClip : 0u) };
     key.biasScale = biasScale;
     key.biasOffset = biasOffset;
     return key;
@@ -4552,7 +4543,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         key.flags |= 0x200;
     }
     if (motion)
-        key.flags |= 4;
+        key.flags |= regpu::pipeline::kMotion;
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
@@ -10952,12 +10943,8 @@ void BuildSeedPipelines()
         const std::string line(p, end ? end : p + strlen(p));
         p = end ? end + 1 : p + line.size();
         PipelineKey key{};
-        unsigned long long vs, ps;
-        if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x", &vs, &ps, &key.blend, &key.depth, &key.stencilMaskMode, &key.flags,
-                   &key.biasScale, &key.biasOffset) < 6)
+        if (!regpu::pipeline::ParseBasePipeline(line.c_str(), key))
             continue;
-        key.vs = vs;
-        key.ps = ps;
         key.biasOffset = RoundedBias(key.biasOffset);
         if (!seen.insert(PipelineKeyHash{}(key)).second)
             continue;
