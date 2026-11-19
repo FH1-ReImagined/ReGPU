@@ -28,6 +28,8 @@ using Clock = std::chrono::steady_clock;
 #include "gpu/regs.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
+#include "gpu/accepted_retirement_window.h"
+#include "gpu/accepted_retirement_threaded.h"
 #include "precise_sleep.h"
 
 extern HANDLE g_profiledWorker; // renderer.cpp
@@ -139,7 +141,7 @@ void RaiseInterrupt(uint32_t source, uint32_t cpu)
 // 5800X, 98-100 -> 106-108 fps once its main and render threads overlapped.
 namespace work
 {
-enum : uint32_t { kPad, kRegs, kShader, kDraw, kSwap, kWriteBack, kStore };
+enum : uint32_t { kPad, kRegs, kShader, kDraw, kSwap, kWriteBack, kStore, kAcceptedSwap };
 constexpr uint64_t kWords = 16ull << 20; // 64 MB
 std::vector<uint32_t> g_ring(kWords);
 alignas(64) std::atomic<uint64_t> g_head{ 0 }; // written by the command processor
@@ -551,6 +553,16 @@ void WorkerLoop()
             case work::kSwap:
                 FrameOnSwap(uint64_t(a[0]) | uint64_t(a[1]) << 32, a[2]);
                 break;
+            case work::kAcceptedSwap:
+            {
+                const uint64_t swap = uint64_t(a[0]) | uint64_t(a[1]) << 32;
+                const auto ticket = words == regpu::accepted_threaded::kPayloadWords
+                    ? regpu::accepted_threaded::Ticket{a[3], uint64_t(a[4]) | uint64_t(a[5]) << 32}
+                    : regpu::accepted_threaded::Ticket{};
+                regpu::accepted_threaded::WorkerScope accepted(ticket, tail, swap, words);
+                FrameOnSwap(swap, a[2]);
+                break;
+            }
             case work::kWriteBack:
                 PendingWrites::Add(RendererFenceSubmit(), a[0], a[1]); // after the host GPU, as on the command processor
                 break;
@@ -563,7 +575,7 @@ void WorkerLoop()
             tail += uint64_t(words) + 1;
             // Publish now and then (the command processor waits on this when the log is full
             // or it must catch up): every record would cost a wake-up each.
-            if (type == work::kWriteBack || type == work::kStore || type == work::kSwap || (tail & 0x3FFF) < words + 1)
+            if (type == work::kWriteBack || type == work::kStore || type == work::kSwap || type == work::kAcceptedSwap || (tail & 0x3FFF) < words + 1)
             {
                 work::g_tail.store(tail, std::memory_order_release);
                 work::g_tail.notify_all();
@@ -942,6 +954,15 @@ uint32_t ExecutePacket(uint32_t ptr)
         if (count >= 2 && arg(0) == 0x53574150)
         {
             const uint64_t n = ++g_gpu.swaps;
+            regpu::accepted_retirement::Scope accepted;
+            regpu::accepted_threaded::ProducerScope threadedAccepted;
+            if (regpu::accepted_threaded::Enabled()) {
+                const bool tagged = header == regpu::accepted_retirement::kHeader && count == 6;
+                threadedAccepted.Begin(header, count, tagged ? arg(4) : 0, tagged ? arg(5) : 0, n, work::Active());
+            } else if (regpu::accepted_retirement::Enabled()) {
+                const bool tagged = header == regpu::accepted_retirement::kHeader && count == 6;
+                accepted.Begin(header, count, tagged ? arg(4) : 0, tagged ? arg(5) : 0, n, work::Active());
+            }
             PresentSwap(n, arg(1) & 0x1FFFF000);
             // The guest's VdSwap returned long ago; pacing the command processor here holds the
             // title back once the ring fills, which caps it the same way.
@@ -1627,11 +1648,28 @@ void PresentSwap(uint64_t frame, uint32_t frontBuffer)
     seg::g_tile = RendererTile{};
     if (work::Active())
     {
-        uint32_t* p = work::Begin(work::kSwap, 3);
-        p[0] = uint32_t(frame);
-        p[1] = uint32_t(frame >> 32);
-        p[2] = frontBuffer;
-        work::End(3);
+        if (regpu::accepted_threaded::Enabled() && regpu::accepted_threaded::ProducerTicket())
+        {
+            const auto ticket = regpu::accepted_threaded::ProducerTicket();
+            uint32_t* p = work::Begin(work::kAcceptedSwap, regpu::accepted_threaded::kPayloadWords);
+            const uint64_t position = work::g_head.load(std::memory_order_relaxed);
+            regpu::accepted_threaded::Bind(ticket, position, work::kWords);
+            p[0] = uint32_t(frame);
+            p[1] = uint32_t(frame >> 32);
+            p[2] = frontBuffer;
+            p[3] = ticket.id;
+            p[4] = uint32_t(ticket.generation);
+            p[5] = uint32_t(ticket.generation >> 32);
+            work::End(regpu::accepted_threaded::kPayloadWords);
+        }
+        else
+        {
+            uint32_t* p = work::Begin(work::kSwap, 3);
+            p[0] = uint32_t(frame);
+            p[1] = uint32_t(frame >> 32);
+            p[2] = frontBuffer;
+            work::End(3);
+        }
     }
     else
         FrameOnSwap(frame, frontBuffer);

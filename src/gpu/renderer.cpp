@@ -54,8 +54,27 @@
 #include "png.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
+#include "gpu/accepted_retirement_window.h"
+#include "gpu/accepted_retirement_threaded.h"
+#include "gpu/m7_loaded_count_receipt.h"
 #include "gpu/shader_scan.h"
 #include "gpu/resolve_pack.h"
+#include "gpu/native_scene_resolve_coverage.h"
+#include "gpu/native_scene_blit.h"
+#include "gpu/native_scene_depth_stencil_bit_seed.h"
+#include "gpu/native_scene_private_pair_readback.h"
+#include "gpu/native_scene_private_samples.h"
+#include "gpu/native_scene_stock_query_census.h"
+#include "gpu/native_scene_textured_common_grid.h"
+#include "gpu/native_scene_stock_dsv_witness.h"
+#include "gpu/native_scene_stock_postresolve.h"
+#include "gpu/native_scene_sampler_lease.h"
+#include "regpu/native_scene.h"
+#include "gpu/native_scene_scissor.h"
+#include "gpu/native_scene_alias_scale.h"
+#include "gpu/native_scene_resolve_size.h"
+#include "gpu/native_scene_pixel_edge.h"
+#include "gpu/native_scene_frame_descriptors.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -97,6 +116,17 @@ uint32_t OutputHeight()
 // Upscaling: the 3D scene of a frame renders at this fraction of the output (1 otherwise);
 // after the scene is upscaled (UpscaleScene), the rest of the frame renders at full size.
 float g_sceneScale = 1.0f;
+using ExplicitSceneSize = regpu::NativeSceneSize;
+ExplicitSceneSize RequestedExplicitScene() { return regpu::GetNativeSceneSize(); }
+bool g_explicitPhase=false, g_explicitFrame=false;
+thread_local bool g_explicitPrimaryAliasDraw=false;
+struct ExplicitAliasDrawScope {
+    bool saved=g_explicitPrimaryAliasDraw;
+    ExplicitAliasDrawScope() noexcept { g_explicitPrimaryAliasDraw=false; }
+    ~ExplicitAliasDrawScope() noexcept { g_explicitPrimaryAliasDraw=saved; }
+};
+regpu::native_scene::ColorBlit g_explicitBlit;
+bool g_explicitBlitReady=false;
 // The scene of this frame is still being drawn and is upscaled when it is done (any
 // upscaler; with a temporal one, also at native scale for anti-aliasing).
 bool g_scenePhase = false;
@@ -238,11 +268,11 @@ uint32_t SurfaceRows()
 }
 // The whole-number scale a tall pass is drawn at (IntegerTallScale): the output's scale rounded up.
 // The host surfaces are made large enough for it (at 1080p, 2x: as large as 1440p's).
-uint32_t TallScaleRoom() { return std::max<uint32_t>(1, (OutputHeight() + kHeight - 1) / kHeight); }
-uint32_t SurfaceWidth() { return std::max(OutputWidth(), TallScaleRoom() * kWidth); }
+uint32_t TallScaleRoom() { return std::max<uint32_t>(1, (std::max(OutputHeight(), RequestedExplicitScene().height) + kHeight - 1) / kHeight); }
+uint32_t SurfaceWidth() { return std::max({OutputWidth(), RequestedExplicitScene().width, TallScaleRoom() * kWidth}); }
 uint32_t SurfaceHeight()
 {
-    return std::max(uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + kHeight - 1) / kHeight), TallScaleRoom() * SurfaceRows());
+    return std::max(uint32_t((uint64_t(std::max(OutputHeight(), RequestedExplicitScene().height)) * SurfaceRows() + kHeight - 1) / kHeight), TallScaleRoom() * SurfaceRows());
 }
 
 // A tall pass (a shadow atlas) is drawn at a whole number of host texels per guest texel: titles move
@@ -279,14 +309,23 @@ float PassScale()
     return memo.result;
 }
 float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale * PassScale(); }
-float ScaleWide() { return float(OutputWidth()) / float(kWidth) * g_sceneScale * PassScale(); }
+float ScaleWide() { return (g_explicitPhase ? float(RequestedExplicitScene().width) / float(kWidth) : float(OutputWidth()) / float(kWidth) * g_sceneScale) * PassScale(); }
 bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
-float ScaleX() { return WidePass() ? ScaleWide() : ScaleY(); }
-LONG HostX(LONG v) { return LONG(std::lround(double(v) * ScaleX())); }
-LONG HostY(LONG v) { return LONG(std::lround(double(v) * ScaleY())); }
+float ScaleX() { return (WidePass() || g_explicitPrimaryAliasDraw) ? ScaleWide() : ScaleY(); }
+LONG HostX(LONG v) { return LONG(std::lround(double(v) * (g_explicitPhase && (WidePass() || g_explicitPrimaryAliasDraw) ? double(RequestedExplicitScene().width) / kWidth * PassScale() : double(ScaleX())))); }
+LONG HostY(LONG v) { return LONG(std::lround(double(v) * (g_explicitPhase ? double(RequestedExplicitScene().height) / kHeight * PassScale() : double(ScaleY())))); }
+bool ExplicitMainPixelEdges() {
+    return g_explicitPhase && WidePass() && PassWidth()==kWidth && PassHeight()==kHeight && PassScale()==1.0f;
+}
+LONG HostXEdge(LONG v) {
+    return ExplicitMainPixelEdges() ? regpu::native_scene::PixelCenterEdge(double(v)*double(RequestedExplicitScene().width)/kWidth) : HostX(v);
+}
+LONG HostYEdge(LONG v) {
+    return ExplicitMainPixelEdges() ? regpu::native_scene::PixelCenterEdge(double(v)*double(RequestedExplicitScene().height)/kHeight) : HostY(v);
+}
 D3D12_RECT ToHost(const D3D12_RECT& r)
 {
-    return { HostX(r.left), HostY(r.top), HostX(r.right), HostY(r.bottom) };
+    return { HostXEdge(r.left), HostYEdge(r.top), HostXEdge(r.right), HostYEdge(r.bottom) };
 }
 
 // Wider than 16:9: the output is `wide` times as wide as 16:9 for its height. The view
@@ -303,6 +342,9 @@ float ViewExtent()
     return 1.0f + (std::max(OutputWide(), 1.0f) - 1.0f) * widePercent / 100.0f;
 }
 constexpr UINT kFrames = 3;
+StockPostResolve g_stockPost; // master recorder only
+std::atomic<UINT64> g_censusEpoch{0}; // Every draw, rebind or resolve expires the prior next-draw ticket.
+UINT g_censusQueries=0; // Main recorder only; capped over the entire requested window.
 // The per-frame upload ring. Without guest memory mapped for the GPU (drivers without
 // ID3D12Device13, e.g. older Windows 10 builds) every vertex buffer is copied into it: the
 // menus alone then need well over 64 MB a frame, and draws past the end were dropped (black
@@ -398,6 +440,7 @@ struct ResolvedTexture
     uint32_t hostWidth = 0, hostHeight = 0;  // the texture (see ScaleX/ScaleY)
     uint64_t frame = ~0ull;                  // renderer frame of the last resolve into it
     uint64_t serial = 0;                     // stamp of the last resolve into it (g_resolveSerial)
+    regpu::native_scene::ResolveCoverage explicitCoverage;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // R32_FLOAT for depth resolves
     bool swapped = false; // resolved with the copy swap bit: guest memory has red and blue exchanged
     // Depth resolves: the guest's D24S8 words as RGBA8 (stencil, then depth's low to high bytes),
@@ -441,6 +484,24 @@ struct FrameResources
     UINT descriptorsUsed = 0;
     UINT64 fence = 0;
     std::vector<ComPtr<ID3D12Resource>> garbage; // released once this frame's work completes
+    regpu::native_scene::FrameBlitDescriptors explicitSlots[2];
+    ComPtr<ID3D12Resource> explicitTargets[2][2];
+    bool explicitSlotActive[2]{};
+    // Private proof-only descriptors, owned by this frame slot through its fence.
+    ComPtr<ID3D12DescriptorHeap> privatePairSrv,privatePairRtv,privatePairDsv;
+    PrivatePairReadback privatePairReadback,privatePairClearReadback;
+    PrivateDrawColorBefore privateDrawColorBefore;
+    bool pairedDrawDelta=false;
+    PrivatePassedSamples privateSamples;
+    StockQueryCensus census;
+    TexturedCommonGrid common;
+    ConvertedOutput converted;
+    StockDsvWitness stockDsv;
+    D3D12_RECT pairedStockRect{}, pairedOutputRect{};
+    ComPtr<ID3D12Resource> replaySourceColor,replaySourceDepth,replayColor,replayDepth;
+    UINT64 replayFrame=0,replayDraw=0;
+    uint32_t replayColorBase=0,replayDepthBase=0,replayWidth=0,replayHeight=0;
+    bool replayArmed=false,replayDrawArmed=false;
     bool timed = false; // REGPU_PERF: GPU timestamps were written for this frame
     // Extra command lists of this frame (parallel draw pieces, main list continuations).
     std::vector<std::pair<ComPtr<ID3D12CommandAllocator>, ComPtr<ID3D12GraphicsCommandList>>> pool;
@@ -535,6 +596,7 @@ struct BoundTexture
 struct PipelineEntry
 {
     ComPtr<ID3D12PipelineState> pso;
+    UINT postState=0,postFaces=0; // immutable effective D32S8 PSO metadata when census is enabled
     std::atomic<int> state{ 0 }; // 0 building, 1 ready, 2 failed
     // The build, run once by whoever claims it first: a pool thread, or a draw that must wait for it
     // (WaitForPipeline), so that draw doesn't wait behind every build queued before it.
@@ -624,9 +686,26 @@ UINT g_samplerStride = 0;
 std::atomic<UINT> g_samplerBank{ 0 };
 std::atomic<int> g_anisoRequest{ -1 }, g_anisoApplied{ -1 };
 std::mutex g_samplerMutex;
+// Separate one-shot diagnostic. The default dynamic exclusion is unchanged.
+bool CommonSamplerLeaseRequested() {
+    static const bool on=[] { const char* v=getenv("REGPU_NATIVE_SCENE_COMMON_SAMPLER_LEASE");
+        return v && std::strcmp(v,"1")==0; }();
+    return on && StockQueryCensus::CommonGrid();
+}
+using CommonSamplerReceipts=regpu::native_scene::SamplerLeaseReceipts<D3D12_SAMPLER_DESC>;
+CommonSamplerReceipts g_commonSamplerReceipts;
+ConvertedSamplerBanks g_convertedBanks;
+RecurringBorrowedRtv g_recurringRtv;
+static_assert(CommonSamplerReceipts::capacity==ConvertedSamplerBanks::spill*ConvertedSamplerBanks::slots);
+bool g_convertedAttempted=false; // master recorder only; immutable sampler bank is never reused
+bool ImmutableDrawSamplersRequested() { return CommonSamplerLeaseRequested() || ConvertedOutput::Requested(); }
+
 
 void WriteSamplerBank(UINT bank, int aniso)
 {
+    if(ImmutableDrawSamplersRequested() && bank>=kSamplerBanks) { g_commonSamplerReceipts.poisoned=true;return; }
+    const UINT physicalBank=ConvertedOutput::Requested() ? g_convertedBanks.ForWrite(bank) : bank;
+    std::array<D3D12_SAMPLER_DESC,8> receipt;
     for (UINT i = 0; i < 8; i++)
     {
         D3D12_SAMPLER_DESC s = g_samplerBase[i];
@@ -644,9 +723,12 @@ void WriteSamplerBank(UINT bank, int aniso)
             s.MaxAnisotropy = UINT(std::clamp(aniso, 1, 16));
         }
         D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += size_t(bank * 8 + i) * g_samplerStride;
+        h.ptr += size_t(physicalBank * 8 + i) * g_samplerStride;
         g_r.device->CreateSampler(&s, h);
+        if(ImmutableDrawSamplersRequested()) receipt[i]=s;
     }
+    if(ImmutableDrawSamplersRequested())
+        g_commonSamplerReceipts.Record(reinterpret_cast<uintptr_t>(g_r.samplerHeap.Get()),bank,receipt);
 }
 
 // The sampler table for the next draw, after a filtering change if one is pending (draw thread).
@@ -665,8 +747,65 @@ D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
         }
     }
     D3D12_GPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart();
-    h.ptr += uint64_t(g_samplerBank.load()) * 8 * g_samplerStride;
+    const UINT logical=g_samplerBank.load();
+    const UINT physical=ConvertedOutput::Requested() ? g_convertedBanks.ForRead(logical) : logical;
+    h.ptr += uint64_t(physical) * 8 * g_samplerStride;
     return h;
+}
+
+// Called only after every ordinary common-grid precondition/allocation succeeded.
+// No GPU-visible source descriptor copies: recreate the exact successful CPU receipt.
+bool PrepareCommonSamplerLease(ImmutableDrawSamplers& grid,D3D12_GPU_DESCRIPTOR_HANDLE actual,
+                               bool recurring=false) {
+    if(!ImmutableDrawSamplersRequested() || !LeanFetch() || !g_r.device || !g_r.samplerHeap ||
+       FAILED(g_r.device->GetDeviceRemovedReason())) return false;
+    const auto desc=g_r.samplerHeap->GetDesc();
+    if(desc.Type!=D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ||
+       !(desc.Flags&D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc.NumDescriptors!=(ConvertedOutput::Requested() ? ConvertedSamplerBanks::capacity : CommonSamplerReceipts::capacity)) return false;
+    ComPtr<ID3D12Device> owner;
+    if(FAILED(g_r.samplerHeap->GetDevice(IID_PPV_ARGS(&owner))) || owner.Get()!=g_r.device) return false;
+    std::unique_lock lock(g_samplerMutex,std::defer_lock);
+    if (recurring) {
+        if (!lock.try_lock()) return false;
+    } else lock.lock();
+    UINT bank=0;
+    const auto begin=g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart();
+    CommonSamplerReceipts::Receipt receipt;
+    if(!CommonSamplerReceipts::Bank(begin.ptr,actual.ptr,g_samplerStride,bank) || bank!=g_samplerBank.load()) return false;
+    const auto heapIdentity=reinterpret_cast<uintptr_t>(g_r.samplerHeap.Get());
+    if (recurring && g_recurringRtv.retired) {
+        const auto& previous=g_recurringRtv.sampler;
+        if (!g_recurringRtv.ready || g_convertedBanks.protectedBank.load()!=-1 || g_convertedBanks.ForRead(bank)!=bank ||
+            previous.samplerHeap.Get()!=g_r.samplerHeap.Get() || previous.samplerBank!=bank ||
+            previous.samplerOriginal.ptr!=actual.ptr ||
+            previous.samplerImmutable.ptr!=begin.ptr+UINT64(CommonSamplerReceipts::reserved)*g_samplerStride ||
+            !g_commonSamplerReceipts.StillCurrent(heapIdentity,bank,previous.samplerSerial)) {
+            g_recurringRtv.Stop();
+            return false;
+        }
+        grid=previous;
+        g_convertedBanks.Protect(bank);
+        g_recurringRtv.ready=false;
+        return true;
+    }
+    if (!g_commonSamplerReceipts.Take(heapIdentity,bank,receipt)) return false;
+    auto cpu=g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr+=SIZE_T(CommonSamplerReceipts::reserved)*g_samplerStride;
+    for(UINT i=0;i<8;++i) {
+        g_r.device->CreateSampler(&receipt.descriptors[i],cpu);
+        cpu.ptr+=g_samplerStride;
+    }
+    if(FAILED(g_r.device->GetDeviceRemovedReason())) return false;
+    // Keep the stock source bank equally immutable until this submission retires.
+    // If filtering cycles all four banks in that interval its next generation goes to the spill bank.
+    if (ConvertedOutput::Requested()) g_convertedBanks.Protect(bank);
+    grid.samplerHeap=g_r.samplerHeap;
+    grid.samplerOriginal=actual;
+    grid.samplerImmutable=begin;
+    grid.samplerImmutable.ptr+=UINT64(CommonSamplerReceipts::reserved)*g_samplerStride;
+    grid.samplerBank=bank;grid.samplerSerial=receipt.serial;grid.samplerLease=true;
+    // Reserved slots are never written again, even after common's frame fence closes.
+    return true;
 }
 
 std::atomic<uint64_t> g_outputRequest{ 0 }; // regpu::SetOutputSize: width << 32 | height, 0 none (ApplyOutputSize)
@@ -1933,9 +2072,15 @@ void Init()
         rs.NumParameters = 5;
         D3D12_DESCRIPTOR_HEAP_DESC sh{};
         sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-        sh.NumDescriptors = 8 * kSamplerBanks;
+        sh.NumDescriptors = ConvertedOutput::Requested() ? ConvertedSamplerBanks::capacity :
+            CommonSamplerLeaseRequested() ? CommonSamplerReceipts::capacity : 8 * kSamplerBanks;
         sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        Check(d->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_r.samplerHeap)), "CreateDescriptorHeap(sampler)");
+        HRESULT samplerResult=d->CreateDescriptorHeap(&sh,IID_PPV_ARGS(&g_r.samplerHeap));
+        if (FAILED(samplerResult) && ConvertedOutput::Requested()) {
+            sh.NumDescriptors=8*kSamplerBanks;
+            samplerResult=d->CreateDescriptorHeap(&sh,IID_PPV_ARGS(&g_r.samplerHeap));
+        }
+        Check(samplerResult,"CreateDescriptorHeap(sampler)");
         g_samplerStride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         for (UINT i = 0; i < 8; i++)
         {
@@ -1948,7 +2093,10 @@ void Init()
             s.ComparisonFunc = samplers[i].ComparisonFunc;
             s.MaxLOD = samplers[i].MaxLOD;
         }
-        WriteSamplerBank(0, -1);
+        if(ImmutableDrawSamplersRequested()) {
+            std::lock_guard lock(g_samplerMutex);
+            WriteSamplerBank(0,-1);
+        } else WriteSamplerBank(0,-1);
     }
     ComPtr<ID3DBlob> blob, error;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
@@ -2049,6 +2197,7 @@ void ApplyOutputSize()
     const uint32_t w = uint32_t(request >> 32), h = uint32_t(request);
     if (w == st.width && h == st.height)
         return;
+    if (g_convertedAttempted && ConvertedOutput::RecurringBorrowRequested()) g_recurringRtv.Stop();
     // Every frame in flight may still use the old surfaces.
     if (const UINT64 last = g_r.nextFence - 1; g_r.fence->GetCompletedValue() < last)
     {
@@ -2177,6 +2326,11 @@ void SelectSurfaces(bool force)
                    depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
     if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
+    if (ConvertedOutput::Requested() && !C().worker) Frame().converted.Cancel();
+    if (StockPostResolve::Enabled() && !C().worker) g_stockPost.Finish("intervening_rebind");
+    if (StockQueryCensus::Enabled()) ++g_censusEpoch;
+    if (StockQueryCensus::NoClear() && !C().worker) Frame().census.Finish("intervening_rebind");
+    Frame().replayDrawArmed=false; // A rebinding invalidates the isolated candidate.
     if (C().colorBase != ~0u && !C().worker) // (workers leave surfaces as render targets)
         if (auto it = g_r.colorSurfaces.find(C().colorBase); it != g_r.colorSurfaces.end()) // (not a new empty one)
             it->second.state = C().colorState;
@@ -2316,7 +2470,14 @@ void EvictBindless()
         return;
     for (auto it = g_r.bindless.begin(); it != g_r.bindless.end();)
     {
-        if (it->second.lastFrame + kFrames + 2 < g_r.frame)
+        bool pinned=false;
+        if (ConvertedOutput::Requested()) for (const auto& f:g_r.frames)
+            pinned|=f.converted.state==ConvertedOutput::State::bound && f.converted.descriptor==it->second.index &&
+                f.converted.image.Get()==it->second.resource.Get();
+        if(StockQueryCensus::CommonGrid()) for(const auto& f:g_r.frames)
+            pinned|=f.common.recorded && f.common.descriptor==it->second.index &&
+                    f.common.primary.Get()==it->second.resource.Get();
+        if (!pinned && it->second.lastFrame + kFrames + 2 < g_r.frame)
         {
             Frame().garbage.push_back(std::move(it->second.resource));
             g_r.bindlessFree.push_back(it->second.index);
@@ -2351,6 +2512,172 @@ void BeginFrameIfNeeded()
         WaitFenceValue(f.fence, INFINITE);
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
+    if (ConvertedOutput::Requested()) {
+        auto& lease=f.converted;
+        lease.Cancel();
+        if (lease.state==ConvertedOutput::State::bound && !lease.failed) {
+            const auto completed=g_r.fence->GetCompletedValue();
+            if (completed==UINT64_MAX) lease.failed=true;
+            else if (lease.Retired(completed)) {
+                if (lease.colorOracle.recorded) {
+                    auto r=lease.colorOracle.Finish();
+                    if (FAILED(g_r.device->GetDeviceRemovedReason())) r={};
+                    const bool accepted=r.readable && r.pixels==UINT64(1920)*1080 && !r.different && r.stockChanged;
+                    Log("converted private color oracle: frame=%llu draw=%llu serial=%llu fence=%llu completed=%llu readable=%u pixels=%llu different=%llu stockChanged=%llu accepted=%u",
+                        lease.frame,lease.draw,lease.serial,lease.fence,completed,UINT(r.readable),r.pixels,r.different,r.stockChanged,UINT(accepted));
+                }
+                g_convertedBanks.Retire();
+                const bool detail=!ConvertedOutput::RecurringBorrowRequested() || g_recurringRtv.DetailNext();
+                if (ConvertedOutput::RecurringBorrowRequested()) {
+                    g_recurringRtv.ReleaseCompleted(lease,completed);
+                    if (regpu::accepted_threaded::Enabled()) {
+                        regpu::accepted_threaded::NativeRetired(g_recurringRtv.retired, g_recurringRtv.frame,
+                            g_recurringRtv.serial, g_recurringRtv.fence, g_recurringRtv.stopped);
+                    } else if (regpu::accepted_retirement::Enabled()) {
+                        regpu::accepted_retirement::NativeRetired(g_recurringRtv.retired, g_recurringRtv.frame,
+                            g_recurringRtv.serial, g_recurringRtv.fence, g_recurringRtv.stopped);
+                    }
+                }
+                if (detail) Log("converted output sampler retired: frame=%llu draw=%llu serial=%llu fence=%llu completed=%llu",
+                    lease.frame,lease.draw,lease.serial,lease.fence,completed);
+                lease={};
+            }
+        }
+    }
+    if(StockQueryCensus::CommonGrid() && f.common.recorded && f.common.fence && !f.common.signalFailed) {
+        const UINT64 completed=g_r.fence->GetCompletedValue();
+        if(completed==UINT64_MAX) {
+            f.common.signalFailed=true; // keep all objects until renderer teardown
+            Log("textured common result: frame=%llu draw=%llu deviceRemoved=1 accepted=0",f.common.frame,f.common.draw);
+        } else if(completed>=f.common.fence) {
+            const auto r=f.common.Read(completed);
+            bool same=r.readable,changed=false;
+            for(UINT i=0;i<3;++i) {
+                same &= !r.seed[i] && !r.mismatch[i];
+                changed |= r.stockChanged[i]!=0;
+                Log("textured common plane: frame=%llu draw=%llu plane=%u pixels=%u readable=%u seedMismatch=%llu postMismatch=%llu stockChanged=%llu",
+                    f.common.frame,f.common.draw,i,TexturedCommonGrid::width*TexturedCommonGrid::height,
+                    unsigned(r.readable),r.seed[i],r.mismatch[i],r.stockChanged[i]);
+            }
+            const bool accepted=same && changed && r.passed[0] && r.passed[0]==r.passed[1];
+            Log("textured common result: frame=%llu draw=%llu fence=%llu completed=%llu descriptor=%u serial=%llu epoch=%llu readable=%u stockPassed=%llu privatePassed=%llu accepted=%u",
+                f.common.frame,f.common.draw,f.common.fence,completed,f.common.descriptor,f.common.serial,f.common.epoch,
+                unsigned(r.readable),r.passed[0],r.passed[1],unsigned(accepted));
+            if(f.common.samplerLease) Log("common sampler lease retired: frame=%llu draw=%llu bank=%u serial=%llu fence=%llu completed=%llu accepted=%u",
+                f.common.frame,f.common.draw,f.common.samplerBank,f.common.samplerSerial,f.common.fence,completed,unsigned(accepted));
+            f.common={}; // clears the descriptor pin after the last real fence only
+        }
+    } else if(StockQueryCensus::CommonGrid() && !f.common.recorded) f.common={};
+    if (StockQueryCensus::DsvDiscovery() && f.stockDsv.recorded && !f.stockDsv.failed && f.stockDsv.fence) {
+        auto& w=f.stockDsv;
+        const UINT64 completed=g_r.fence->GetCompletedValue();
+        if (completed==UINT64_MAX) {
+            w.failed=true;
+            Log("stock dsv ordinal2 retired: frame=%llu draw=%llu deviceRemoved=1 accepted=0",w.frame,w.draw);
+        } else if (completed>=w.fence) {
+            UINT64 delta[2]{};
+            StockDsvWitness::FirstChange first[2];
+            const bool readable=w.Read(completed,delta,first);
+            if (readable) for (UINT i=0;i<2;++i) {
+                Log("stock dsv ordinal2 plane: frame=%llu draw=%llu plane=%u format=%u step=%u pitch=%u first=%ld,%ld old=%08X new=%08X",
+                    w.frame,w.draw,i,UINT(w.plane[i].Footprint.Format),w.step[i],w.plane[i].Footprint.RowPitch,
+                    first[i].x,first[i].y,first[i].before,first[i].after);
+            }
+            Log("stock dsv ordinal2 retired: frame=%llu draw=%llu fence=%llu completed=%llu mask=%u roi=%ld,%ld,%ld,%ld readable=%u depthChanged=%llu stencilChanged=%llu accepted=%u",
+                w.frame,w.draw,w.fence,completed,w.planes,w.roi.left,w.roi.top,w.roi.right,w.roi.bottom,
+                unsigned(readable),delta[0],delta[1],unsigned(readable && StockDsvWitness::Accepted(w.planes,delta[0],delta[1])));
+            w={};
+        }
+    }
+    if (f.census.frame) {
+        UINT64 passed[StockQueryCensus::kMax]{};
+        const UINT64 completed=g_r.fence->GetCompletedValue();
+        const bool readable=f.census.Read(f.fence,completed,passed);
+        Log("stock query census totals: frame=%llu resolves=%u ready=%u clears=%u eligible=%u queries=%u",
+            f.census.frame,f.census.resolves,f.census.ready,f.census.clears,f.census.eligible,f.census.count);
+        if(StockQueryCensus::NoClear()) {
+            f.census.Finish("frame_ended");
+            for(UINT i=0;i<f.census.resolves;++i) {
+                const auto& d=f.census.dispositions[i];
+                Log("stock no-clear disposition: frame=%llu resolve=%u base=1CE2D000 control=00100000 draw=%llu colorBase=%08X depthBase=%08X vs=%016llX ps=%016llX ready=%u status=%s",
+                    f.census.frame,i+1,d.draw,d.colorBase,d.depthBase,d.vs,d.ps,unsigned(d.ready),
+                    d.first ? d.first : "unclassified");
+            }
+        }
+        for(UINT i=0;i<f.census.count;++i) {
+            const auto& r=f.census.rows[i];
+            Log("stock query census: frame=%llu resolve=%u base=%08X draw=%llu colorBase=%08X depthBase=%08X vs=%016llX ps=%016llX viewport=%ux%u stock=%ld,%ld,%ld,%ld output=%ld,%ld,%ld,%ld fence=%llu completed=%llu readable=%u passed=%llu",
+                f.census.frame,r.ordinal,r.base,r.draw,r.colorBase,r.depthBase,r.vs,r.ps,r.width,r.height,
+                r.stock.left,r.stock.top,r.stock.right,r.stock.bottom,r.output.left,r.output.top,r.output.right,r.output.bottom,
+                f.fence,completed,unsigned(readable),passed[i]);
+        }
+        f.census={};
+    }
+    if (StockQueryCensus::Enabled() && StockQueryCensus::InWindow(g_r.frame)) f.census.frame=g_r.frame;
+    if (f.pairedDrawDelta) {
+        const UINT64 completed=g_r.fence->GetCompletedValue();
+        const auto delta=f.fence && completed!=UINT64_MAX && completed>=f.fence
+            ? PrivatePairedDelta::Compare(f.privatePairReadback,f.privatePairClearReadback,
+                                          f.replayFrame,f.pairedStockRect,f.pairedOutputRect)
+            : PrivatePairedDelta::Result{};
+        UINT64 passed[2]{};
+        const bool samplesReadable=f.privateSamples.Read(f.fence,completed,passed);
+        for (UINT side=0; side<2; ++side) {
+            const auto& n=delta.side[side];
+            const auto& rect=side ? f.pairedOutputRect : f.pairedStockRect;
+            if (f.privateSamples.requested) {
+                const char* status=PrivatePassedSamples::Classify(samplesReadable,passed[side],
+                    delta.readable,n.color || n.depth || n.stencil);
+                Log("private paired draw samples: frame=%llu draw=%llu fence=%llu completed=%llu side=%s readable=%u passed=%llu planesReadable=%u status=%s",
+                    f.replayFrame,f.replayDraw,f.fence,completed,side ? "private" : "stock",
+                    unsigned(samplesReadable),passed[side],unsigned(delta.readable),status);
+            }
+            Log("private paired draw delta: frame=%llu draw=%llu fence=%llu completed=%llu side=%s scissorLTRB=%ld,%ld,%ld,%ld beforeBytes=%llu afterBytes=%llu readable=%u pixels=%llu colorChanged=%llu depthChanged=%llu stencilChanged=%llu",
+                f.replayFrame,f.replayDraw,f.fence,completed,side ? "private" : "stock",
+                rect.left,rect.top,rect.right,rect.bottom,f.privatePairReadback.bytes,
+                f.privatePairClearReadback.bytes,unsigned(delta.readable),n.pixels,n.color,n.depth,n.stencil);
+        }
+        f.privatePairReadback={};
+        f.privatePairClearReadback={};
+        f.pairedDrawDelta=false;
+        f.privateSamples={};
+    }
+    if (f.privatePairReadback.buffer) {
+        const UINT64 complete=g_r.fence->GetCompletedValue();
+        if (complete!=UINT64_MAX && complete>=f.fence) {
+            const auto frame=f.privatePairReadback.frame; const auto bytes=f.privatePairReadback.bytes;
+            const auto result=f.privatePairReadback.Finish();
+            Log("private pair readback: frame=%llu bytes=%llu mapped=%u sourceColor=%016llX sourceDepthStencil=%016llX outputColor=%016llX outputDepthStencil=%016llX compared=%u depthMismatch=%u stencilMismatch=%u invalid=%u colorCompared=%u colorMismatch=%u colorInvalid=%u (FNV64 hashes; no adoption)",
+                (unsigned long long)frame,(unsigned long long)bytes,unsigned(result.mapped),
+                (unsigned long long)result.hash[0],(unsigned long long)result.hash[1],(unsigned long long)result.hash[2],(unsigned long long)result.hash[3],
+                result.compared,result.depthMismatch,result.stencilMismatch,result.invalid,result.colorCompared,result.colorMismatch,result.colorInvalid);
+        } else { Log("private pair readback: fence/device incomplete; no mapped result"); f.privatePairReadback.buffer.Reset(); }
+    }
+    if (f.privateDrawColorBefore.buffer) {
+        const auto complete = g_r.fence->GetCompletedValue();
+        const auto& before = f.privateDrawColorBefore;
+        const auto result = complete != UINT64_MAX && f.fence && complete >= f.fence
+            ? before.Compare(f.privatePairClearReadback) : PrivateDrawColorBefore::Result{};
+        Log("private draw color delta: frame=%llu draw=%llu fence=%llu completed=%llu scissorLTRB=%ld,%ld,%ld,%ld beforeBytes=%llu readable=%u comparedPixels=%llu changedPixels=%llu",
+            (unsigned long long)before.frame, (unsigned long long)before.draw,
+            (unsigned long long)f.fence, (unsigned long long)complete,
+            before.rect.left, before.rect.top, before.rect.right, before.rect.bottom,
+            (unsigned long long)before.bytes, unsigned(result.readable),
+            (unsigned long long)result.pixels, (unsigned long long)result.changed);
+        f.privateDrawColorBefore = {};
+    }
+    if (f.privatePairClearReadback.buffer) {
+        const UINT64 complete=g_r.fence->GetCompletedValue();
+        if (complete!=UINT64_MAX && complete>=f.fence) {
+            const auto frame=f.privatePairClearReadback.frame; const auto bytes=f.privatePairClearReadback.bytes;
+            const auto result=f.privatePairClearReadback.Finish();
+            Log("private pair clear replay: frame=%llu bytes=%llu mapped=%u sourceColor=%016llX sourceDepthStencil=%016llX outputColor=%016llX outputDepthStencil=%016llX compared=%u depthMismatch=%u stencilMismatch=%u invalid=%u colorCompared=%u colorMismatch=%u colorInvalid=%u (FNV64 hashes; no adoption)",
+                (unsigned long long)frame,(unsigned long long)bytes,unsigned(result.mapped),
+                (unsigned long long)result.hash[0],(unsigned long long)result.hash[1],(unsigned long long)result.hash[2],(unsigned long long)result.hash[3],
+                result.compared,result.depthMismatch,result.stencilMismatch,result.invalid,result.colorCompared,result.colorMismatch,result.colorInvalid);
+        } else { Log("private pair clear replay: fence/device incomplete; no mapped result"); f.privatePairClearReadback.buffer.Reset(); }
+    }
+    f.replayArmed=false;f.replayDrawArmed=false;f.replaySourceColor.Reset();f.replaySourceDepth.Reset();f.replayColor.Reset();f.replayDepth.Reset();
     f.garbage.clear();
     ApplyOutputSize(); // (a new resolution: between frames)
     void FinishDeferredWritebacks(UINT frameIndex);
@@ -2481,6 +2808,47 @@ void BeginFrameIfNeeded()
             (!temporalUpscaler || TemporalInit());
         g_temporal = g_scenePhase && temporalUpscaler;
         g_sceneScale = g_scenePhase ? scale : 1.0f;
+        g_explicitPhase=false; g_explicitFrame=false;
+        const auto size=RequestedExplicitScene();
+        // Private validation only: leave earlier/later frames on legacy rendering.
+        // The exact requested frame still performs every normal preflight and proof gate.
+        const char* privateGate=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_FRAME");
+        const bool privateRequested=privateGate && *privateGate;
+        uint64_t privateFrame=0; bool privateValid=privateRequested;
+        if (privateRequested) for (const char* p=privateGate; *p; ++p) {
+            if (*p<'0' || *p>'9' || privateFrame>(UINT64_MAX-unsigned(*p-'0'))/10) { privateValid=false; break; }
+            privateFrame=privateFrame*10+unsigned(*p-'0');
+        }
+        const bool privateNow=privateValid && privateFrame &&
+            (StockQueryCensus::Enabled() ? StockQueryCensus::InWindow(g_r.frame) : privateFrame==g_r.frame);
+        const bool mayAttempt=privateRequested ? privateNow : g_r.frame>=g_upscale.retryFrame;
+        if (privateNow) Log("native scene private pair: begin frame=%llu slot=%u size=%ux%u upscaler=%u retry=%llu listOpen=%u",(unsigned long long)g_r.frame,UINT(&f-g_r.frames),size.width,size.height,unsigned(st.upscaler),(unsigned long long)g_upscale.retryFrame,unsigned(g_r.listOpen));
+        if (size.width && st.upscaler==Settings::Upscaler::Off && mayAttempt) {
+            if (!g_explicitBlitReady) g_explicitBlitReady=g_explicitBlit.Initialize(g_r.device);
+            bool ready=g_explicitBlitReady;
+            for (unsigned i=0;i<2 && ready;i++) {
+                if (!f.explicitSlots[i].srv() && !f.explicitSlotActive[i]) {
+                    // Initialization may have happened on an earlier use of this frame slot.
+                    f.explicitSlots[i].Initialize(g_r.device);
+                }
+                ready=f.explicitSlots[i].Begin(g_r.fence->GetCompletedValue());
+                f.explicitSlotActive[i]=ready;
+                for (unsigned j=0;j<2 && ready;j++) {
+                    f.explicitTargets[i][j].Reset();
+                    ready=regpu::native_scene::ColorBlit::CreateTarget(g_r.device,OutputWidth(),OutputHeight(),
+                        j ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM,f.explicitTargets[i][j]);
+                }
+            }
+            if (privateNow) Log("native scene private pair: preflight frame=%llu ready=%u",(unsigned long long)g_r.frame,unsigned(ready));
+            if (ready) {
+                g_explicitPhase=g_explicitFrame=g_scenePhase=true;g_temporal=false;
+                g_sceneScale=float(size.height)/float(OutputHeight());
+            } else {
+                for (unsigned i=0;i<2;i++) if (f.explicitSlotActive[i]) { f.explicitSlots[i].CancelUnsubmitted(); f.explicitSlotActive[i]=false; }
+                Log("native scene: preflight failed; using legacy frame");
+            }
+        }
+
         if (g_temporal)
             BeginTemporalFrame();
     }
@@ -4390,6 +4758,20 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         mv.RenderTargetWriteMask = rt.BlendEnable ? 0 : D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
     }
     auto entry = std::make_shared<PipelineEntry>();
+    if ((StockPostResolve::Enabled() || (ConvertedOutput::PrivateColorRequested() &&
+            key.vs==0x5D606C137F9A8DDCull && key.ps==0x9074C6D4CEDEBB8Eull)) &&
+        pd.NumRenderTargets==1 && pd.RTVFormats[0]==kColorFormat && pd.SampleDesc.Count==1 &&
+        pd.DSVFormat==DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+        const auto& s=pd.DepthStencilState;
+        entry->postState=0x80000000u | StockDsvWitness::WritePlanes(pd,false) | (UINT(s.DepthEnable!=0)<<2) |
+            (UINT(s.DepthWriteMask)<<3) | (UINT(s.DepthFunc)<<4) | (UINT(s.StencilEnable!=0)<<8) |
+            (UINT(s.StencilWriteMask)<<9) | (UINT(pd.RasterizerState.CullMode)<<17) |
+            (UINT(pd.BlendState.RenderTarget[0].RenderTargetWriteMask)<<20);
+        const auto face=[](const D3D12_DEPTH_STENCILOP_DESC& f) {
+            return UINT(f.StencilFunc) | (UINT(f.StencilFailOp)<<4) | (UINT(f.StencilDepthFailOp)<<8) | (UINT(f.StencilPassOp)<<12);
+        };
+        entry->postFaces=face(s.FrontFace) | (face(s.BackFace)<<16);
+    }
     g_r.pipelines[key] = entry;
     if (!motion && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs)) // the manifest rebuilds pipelines from the base shaders (not live edits)
     {
@@ -4407,6 +4789,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         const auto createStart = std::chrono::steady_clock::now();
         bool hit = false;
         const HRESULT hr = g_pipelineLibrary.CreateOrLoad(g_r.device, pd, key, entry->pso, &hit);
+        if (SUCCEEDED(hr) && key.vs==StockDsvWitness::vs && key.ps==StockDsvWitness::ps &&
+            StockQueryCensus::DsvDiscovery()) StockDsvWitness::Tag(entry->pso.Get(),pd);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
         if (ms > 30.0 && getenv("REGPU_PERF"))
             Log("perf: pipeline %016llx/%016llx took %.1f ms to create (background)", (unsigned long long)key.vs, (unsigned long long)key.ps, ms);
@@ -4532,7 +4916,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
 }
 
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
-    bool coverage = false)
+    bool coverage = false, PipelineKey* actualKey = nullptr)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
     if (coverage)
@@ -4546,6 +4930,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         key.flags |= regpu::pipeline::kMotion;
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
+    if (actualKey) *actualKey=key; // also covers thread-local PSO cache hits
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
     // Runs of draws share a pipeline: the last one's answer first, before the map.
     thread_local PipelineKey lastKey{};
@@ -5998,7 +6383,7 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
 // destRange: the destination's fixed-point range after the scale (the 16-bit integer range for the
 // 16-bit fixed formats); null none. destRow: the image row the surface's rect lands at (0: its own
 // row; a band of a taller image lands destRow rows down).
-void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
+bool BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
     const float* destRange = nullptr, uint32_t toGamma = 0, LONG destRow = 0)
 {
     // REGPU_FREEZE_RESOLVES=<hex base>[,<hex base>...]: those images keep what they hold, later resolves
@@ -6013,7 +6398,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
                 if (uint32_t(strtoul(p, &end, 16)) == base)
                 {
                     it->second.frame = g_r.frame;
-                    return;
+                    return false;
                 }
                 p = *end ? end + 1 : end;
             }
@@ -6024,8 +6409,12 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     // samples blended in garbage, and the exposure flickered and ran away (washed-out menus, black races).
     // REGPU_ROUND_RESOLVE_SIZE=1: to nearest, as before (A/B).
     static LiveSwitch roundSize("REGPU_ROUND_RESOLVE_SIZE");
-    const uint32_t hostWidth = roundSize ? uint32_t(HostX(LONG(width))) : std::max(1u, uint32_t(double(width) * ScaleX() + 1e-3));
-    const uint32_t hostHeight = roundSize ? uint32_t(HostY(LONG(height))) : std::max(1u, uint32_t(double(height) * ScaleY() + 1e-3));
+    auto sizing=roundSize ? regpu::native_scene::ResolveSizing::Round : regpu::native_scene::ResolveSizing::Floor;
+    if (!roundSize && g_explicitPhase && WidePass() && width==kWidth && height==kHeight)
+        sizing=regpu::native_scene::SelectResolveSizing(false,true,true,width,height,PassWidth(),PassHeight(),PassScale());
+    const auto requested=g_explicitPhase ? RequestedExplicitScene() : ExplicitSceneSize{};
+    const uint32_t hostWidth=regpu::native_scene::ResolveDimension(sizing,width,ScaleX(),sizing==regpu::native_scene::ResolveSizing::Round ? uint32_t(HostX(LONG(width))) : 0,requested.width);
+    const uint32_t hostHeight=regpu::native_scene::ResolveDimension(sizing,height,ScaleY(),sizing==regpu::native_scene::ResolveSizing::Round ? uint32_t(HostY(LONG(height))) : 0,requested.height);
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
     if (RendererTracing())
         Log("resolve: -> %08X %ux%u as %ux%u host (scale %.3f x %.3f, texture %ux%u)", base, width, height, hostWidth, hostHeight, ScaleX(), ScaleY(),
@@ -6046,7 +6435,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     const D3D12_RECT sr{ rect.left, rect.top + destRow, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom + destRow, height) };
     FrameResources& f = Frame();
     if (sr.right <= sr.left || sr.bottom <= sr.top || f.descriptorsUsed >= kDescriptorsPerFrame)
-        return;
+        return false;
 
     const UINT slot = f.descriptorBase + f.descriptorsUsed++;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -6086,7 +6475,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
     const uint32_t blitConstants[7] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB), uint32_t(destRange != nullptr),
         std::bit_cast<uint32_t>(destRange ? destRange[0] : 0.0f), std::bit_cast<uint32_t>(destRange ? destRange[1] : 0.0f), uint32_t(toGamma),
-        uint32_t(HostY(destRow)) };
+        uint32_t(HostYEdge(destRow)) };
     C().list->SetGraphicsRoot32BitConstants(1, 7, blitConstants, 0);
     // Width and height stay in game pixels (the size the title knows); the texture and the
     // rectangle are scaled.
@@ -6161,6 +6550,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
+    return true; // the original resolve draw and state restoration were recorded
 }
 
 // EDRAM resolve: copy a rectangle of the render target to the destination
@@ -6750,6 +7140,36 @@ void UpscaleResolved(uint32_t base)
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
 }
 
+// Converts only an independently complete image of this frame. This uses the
+// existing resolve phase heuristic; it is not a typed HUD/scene ownership proof.
+bool ConvertExplicitScene(uint32_t base, unsigned slot) {
+    if (!g_explicitFrame || slot>=2 || !Frame().explicitSlotActive[slot]) return false;
+    auto it=g_r.resolved.find(base);
+    if (it==g_r.resolved.end()) return false;
+    auto& d=it->second;
+    const bool covered=d.resource && d.explicitCoverage.Complete(reinterpret_cast<uintptr_t>(d.resource.Get()),g_r.frame,base,d.hostWidth,d.hostHeight);
+    if (!covered || d.width!=kWidth || d.height!=kHeight || d.hostWidth!=RequestedExplicitScene().width || d.hostHeight!=RequestedExplicitScene().height) return false;
+    const unsigned format=d.format==DXGI_FORMAT_R8G8B8A8_UNORM ? 0 : d.format==DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 2;
+    if (format==2 || !Frame().explicitTargets[slot][format]) return false;
+    auto& f=Frame();
+    try { f.garbage.reserve(f.garbage.size()+2); } catch (...) { return false; }
+    const auto read=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    regpu::native_scene::BlitRequest request{d.resource.Get(),f.explicitTargets[slot][format].Get(),
+        d.hostWidth,d.hostHeight,OutputWidth(),OutputHeight(),read,read,true};
+    if (!g_explicitBlit.Record(g_r.device,C().list->Real(),f.explicitSlots[slot].srv(),0,
+                               f.explicitSlots[slot].rtv(),0,request,f.garbage)) return false;
+    d.resource=f.explicitTargets[slot][format]; d.hostWidth=OutputWidth();d.hostHeight=OutputHeight();
+    d.explicitCoverage.Reset();
+    ID3D12DescriptorHeap* heaps[] = {g_r.srvHeap.Get(),g_r.samplerHeap.Get()};
+    C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1,heaps);
+    C().list->OMSetRenderTargets(1,&C().rtv,FALSE,&C().dsv);
+    C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+    C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_drawState.Invalidate();
+    g_explicitPhase=false;g_scenePhase=false;g_sceneScale=1.0f;g_upscale.switchedThisFrame=true;
+    return true;
+}
+
 // The scene is complete (its full-screen image resolved): upscale it, and render the rest of
 // the frame (post-processing, HUD) at full size.
 void UpscaleScene(uint32_t base)
@@ -6837,8 +7257,166 @@ void ClearColor(uint32_t format, uint32_t lo, uint32_t hi, float out[4])
     }
 }
 
+// Opt-in proof only: record private 1x color/depth/stencil seeds and discard them.
+// No surface map, framebuffer binding, scene phase or presentation is adopted.
+void TryPrivateAttachmentPair(bool recorded, bool depth, uint32_t control, uint32_t base,
+                              uint32_t width, uint32_t height, const D3D12_RECT& rect) {
+    if (StockPostResolve::Enabled()) return; // census records ordinary stock operations only
+    static bool attempted=false;
+    const char* gate=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_FRAME");
+    const bool census=StockQueryCensus::Enabled();
+    if ((!census && attempted) || !gate || !*gate) return;
+    char* end=nullptr; const uint64_t wanted=strtoull(gate,&end,10);
+    if (!wanted || !end || *end || (census ? !StockQueryCensus::InWindow(g_r.frame) : wanted!=g_r.frame)) return;
+    static unsigned dispositionRows=0;
+    if (!census && dispositionRows<32) {
+        ++dispositionRows;
+        Log("native scene private pair: resolve disposition frame=%llu draw=%llu slot=%u explicitFrame=%u phase=%u worker=%u recorded=%u depth=%u control=%08X base=%08X size=%ux%u rect=%ld,%ld-%ld,%ld",(unsigned long long)g_r.frame,(unsigned long long)g_r.drawsThisFrame.load(),UINT(&Frame()-g_r.frames),unsigned(g_explicitFrame),unsigned(g_explicitPhase),unsigned(C().worker),unsigned(recorded),unsigned(depth),control,base,width,height,rect.left,rect.top,rect.right,rect.bottom);
+    }
+    if(C().worker) return;
+    auto& f=Frame();
+    const bool noClear=StockQueryCensus::NoClear();
+    if(noClear) {
+        if(f.census.frame!=5043 || g_r.frame!=5043 || base!=0x1CE2D000u || depth ||
+           control!=0x00100000u || width!=kWidth || height!=kHeight || rect.left!=0 || rect.top!=0 ||
+           rect.right!=LONG(kWidth) || rect.bottom!=LONG(kHeight) ||
+           f.census.resolves>=StockQueryCensus::kNoClearMax ||
+           (StockQueryCensus::FirstTextured() && f.census.resolves!=0)) return;
+        const UINT ordinal=++f.census.resolves;
+        f.census.active=ordinal;
+        auto& d=f.census.dispositions[ordinal-1];
+        d.draw=g_r.drawsThisFrame.load(); d.colorBase=C().colorBase; d.depthBase=C().depthBase;
+        if(!recorded) { f.census.Finish("resolve_not_recorded"); return; }
+        if(!g_explicitFrame || !g_explicitPhase) { f.census.Finish("explicit_phase"); return; }
+    } else {
+        if (!g_explicitFrame || !g_explicitPhase) return;
+        if (!recorded || depth || (control&0x300)!=0x100 || width!=kWidth || height!=kHeight ||
+            rect.left!=0 || rect.top!=0 || rect.right<LONG(kWidth) || rect.bottom<LONG(kHeight)) return;
+        if(census) {
+            if(f.census.frame!=g_r.frame) return;
+            StockQueryCensus::Inc(f.census.resolves);
+        } else attempted=true;
+    }
+    const auto requested=RequestedExplicitScene();
+    auto it=g_r.resolved.find(base);
+    const bool complete=it!=g_r.resolved.end() && it->second.resource &&
+        it->second.explicitCoverage.Complete(reinterpret_cast<uintptr_t>(it->second.resource.Get()),g_r.frame,base,it->second.hostWidth,it->second.hostHeight);
+    bool mapsValid=false;
+    {
+        std::lock_guard lock(g_surfaceMutex);
+        const auto c=g_r.colorSurfaces.find(C().colorBase), z=g_r.depthSurfaces.find(C().depthBase);
+        mapsValid=c!=g_r.colorSurfaces.end() && z!=g_r.depthSurfaces.end() &&
+            c->second.resource.Get()==C().color.Get() && z->second.resource.Get()==C().depth.Get() &&
+            z->second.state==D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    }
+    if (!complete || !mapsValid || !C().color || !C().depth || C().colorState!=D3D12_RESOURCE_STATE_RENDER_TARGET ||
+        g_msaa!=1 || !requested.width || !requested.height || !g_r.fence ||
+        g_r.fence->GetCompletedValue()==UINT64_MAX || f.fence>g_r.fence->GetCompletedValue()) {
+        if(noClear) f.census.Finish(!complete ? "coverage" : !mapsValid ? "attachment_map" :
+            !C().color || !C().depth ? "attachment_identity" :
+            C().colorState!=D3D12_RESOURCE_STATE_RENDER_TARGET ? "color_state" : g_msaa!=1 ? "samples" :
+            !requested.width || !requested.height ? "scene_extent" : "frame_fence");
+        if(!census) Log("native scene private pair: rejected frame=%llu complete=%u maps=%u msaa=%u",(unsigned long long)g_r.frame,unsigned(complete),unsigned(mapsValid),g_msaa); return;
+    }
+    if(census) {
+        const auto color=C().color->GetDesc(), depthDesc=C().depth->GetDesc();
+        const auto fits=[&](const D3D12_RESOURCE_DESC& d) {
+            return d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.DepthOrArraySize==1 &&
+                d.MipLevels==1 && d.SampleDesc.Count==1 && !(d.Flags&D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+                d.Width>=requested.width && d.Height>=requested.height;
+        };
+        const auto require=[&](bool pass,const char* reason) {
+            if(!pass && noClear) f.census.Finish(reason);
+            return pass;
+        };
+        if(!require(fits(color),"color_shape") || !require(fits(depthDesc),"depth_shape") ||
+           !require(color.Format==DXGI_FORMAT_R16G16B16A16_FLOAT,"color_format") ||
+           !require(depthDesc.Format==DXGI_FORMAT_R32G8X24_TYPELESS,"depth_format") ||
+           !require((depthDesc.Flags&D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)!=0,"depth_usage") ||
+           !require((color.Flags&D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)!=0,"color_usage") ||
+           !require(OutputWidth() && OutputHeight() && OutputWidth()<=D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+                    OutputHeight()<=D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,"output_extent") ||
+           !require(StockQueryCensus::PairFootprintsFit(g_r.device,color,depthDesc,OutputWidth(),OutputHeight(),
+               (PrivatePairReadback::kMaxBytes-PrivatePassedSamples::kBytes)/2),"footprint_budget")) return;
+        if(StockQueryCensus::CommonGrid()) {
+            if(f.common.recorded || !it->second.serial || it->second.frame!=g_r.frame || it->second.stale) {
+                f.census.Finish("primary_at_resolve"); return;
+            }
+            f.common.primary=it->second.resource; f.common.serial=it->second.serial;
+            f.common.epoch=g_resolveEpoch; f.common.frame=g_r.frame;
+        }
+        if(noClear) f.census.dispositions[f.census.active-1].ready=true;
+        StockQueryCensus::Inc(f.census.ready);
+        f.census.next={g_censusEpoch.load(),g_r.drawsThisFrame.load(),f.census.resolves,base,
+            C().colorBase,C().depthBase,requested.width,requested.height,C().color.Get(),C().depth.Get(),false};
+        return;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC sd{};sd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;sd.NumDescriptors=3;sd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    D3D12_DESCRIPTOR_HEAP_DESC rd{};rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;rd.NumDescriptors=1;
+    D3D12_DESCRIPTOR_HEAP_DESC dd{};dd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;dd.NumDescriptors=1;
+    if (FAILED(g_r.device->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&f.privatePairSrv))) ||
+        FAILED(g_r.device->CreateDescriptorHeap(&rd,IID_PPV_ARGS(&f.privatePairRtv))) ||
+        FAILED(g_r.device->CreateDescriptorHeap(&dd,IID_PPV_ARGS(&f.privatePairDsv)))) { Log("native scene private pair: descriptor preflight failed"); return; }
+    static regpu::native_scene::DepthStencilBitSeed depthSeed;
+    static bool depthReady=depthSeed.Initialize(g_r.device);
+    if (!depthReady || !g_explicitBlitReady) { Log("native scene private pair: 1x depth/stencil seed unsupported"); return; }
+    try { f.garbage.reserve(f.garbage.size()+4); } catch (...) { Log("native scene private pair: retention failed"); return; }
+    const auto read=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    regpu::native_scene::BlitRequest color{C().color.Get(),nullptr,requested.width,requested.height,OutputWidth(),OutputHeight(),D3D12_RESOURCE_STATE_RENDER_TARGET,read,false};
+    ComPtr<ID3D12Resource> privateColor,privateDepth;
+    const bool colorRecorded=g_explicitBlit.CreateAndRecord(g_r.device,C().list->Real(),f.privatePairSrv.Get(),0,f.privatePairRtv.Get(),0,color,f.garbage,privateColor);
+    const bool depthRecorded=colorRecorded && depthSeed.CreateAndRecord(g_r.device,C().list->Real(),f.privatePairSrv.Get(),1,f.privatePairDsv.Get(),0,C().depth.Get(),requested.width,requested.height,OutputWidth(),OutputHeight(),f.garbage,privateDepth);
+    const char* readbackGate=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_READBACK");
+    if (depthRecorded && readbackGate && std::strcmp(readbackGate,"1")==0) {
+        const char* replay=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_CLEAR_REPLAY");
+        const char* drawReplay=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_DRAW_REPLAY");
+        const char* paired=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIRED_DELTA");
+        const bool defer=replay && std::strcmp(replay,"1")==0 &&
+            drawReplay && std::strcmp(drawReplay,"1")==0 && paired && std::strcmp(paired,"1")==0;
+        bool queued=false;
+        if (!defer) {
+            queued=f.privatePairReadback.Record(g_r.device,C().list->Real(),C().color.Get(),C().depth.Get(),privateColor.Get(),privateDepth.Get(),
+                requested.width,requested.height,OutputWidth(),OutputHeight(),g_r.frame);
+            Log("private pair readback: frame=%llu queued=%u bytes=%llu limit=%llu (one request, no adoption)",
+                (unsigned long long)g_r.frame,unsigned(queued),(unsigned long long)f.privatePairReadback.bytes,(unsigned long long)PrivatePairReadback::kMaxBytes);
+        }
+        const bool slotsAvailable=!f.privatePairReadback.buffer && !f.privatePairClearReadback.buffer &&
+                                  !f.privateDrawColorBefore.buffer;
+        if (defer && !slotsAvailable) Log("private paired draw delta: readback slots already occupied");
+        if (((defer && slotsAvailable) || (queued && f.privatePairReadback.bytes < PrivatePairReadback::kMaxBytes)) &&
+            replay && std::strcmp(replay,"1")==0) {
+            f.pairedDrawDelta=defer;
+            if (defer) {
+                const char* samples=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIRED_SAMPLES");
+                f.privateSamples.requested=samples && std::strcmp(samples,"1")==0;
+                f.pairedStockRect={}; f.pairedOutputRect={};
+                f.privatePairReadback={}; f.privatePairClearReadback={};
+            }
+            f.replaySourceColor=C().color;f.replaySourceDepth=C().depth;f.replayColor=privateColor;f.replayDepth=privateDepth;
+            f.replayFrame=g_r.frame;f.replayDraw=g_r.drawsThisFrame.load();f.replayColorBase=C().colorBase;f.replayDepthBase=C().depthBase;
+            f.replayWidth=requested.width;f.replayHeight=requested.height;f.replayArmed=true;
+        }
+    }
+    // Both seed helpers restore source states but change graphics state and descriptor heaps.
+    if (colorRecorded) {
+        ID3D12DescriptorHeap* heaps[]={g_r.srvHeap.Get(),g_r.samplerHeap.Get()};
+        C().list->SetDescriptorHeaps(g_r.samplerHeap?2:1,heaps);
+        C().list->OMSetRenderTargets(1,&C().rtv,FALSE,&C().dsv);
+        C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+        C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_drawState.Invalidate();
+    }
+    Log("native scene private pair: frame=%llu base=%08X color=%u depthStencil=%u scene=%ux%u output=%ux%u (recorded only; private, not adopted)",
+        (unsigned long long)g_r.frame,base,unsigned(colorRecorded),unsigned(depthRecorded),requested.width,requested.height,OutputWidth(),OutputHeight());
+}
+
 void Resolve()
 {
+    if (ConvertedOutput::Requested() && !C().worker) Frame().converted.Cancel();
+    if (StockPostResolve::Enabled() && !C().worker) g_stockPost.Finish("intervening_resolve");
+    if (StockQueryCensus::Enabled()) ++g_censusEpoch;
+    if (StockQueryCensus::NoClear() && !C().worker) Frame().census.Finish("intervening_resolve");
+    Frame().replayDrawArmed=false; // Any intervening resolve invalidates the candidate.
     g_resolveEpoch++; // texture bindings may now map to a new resolve
     if (!g_r.ok)
         Init();
@@ -7047,13 +7625,90 @@ void Resolve()
         // centre's), so the copy rounds it as the hardware's does. REGPU_NO_RESOLVE_ALPHA2=1: as before.
         static LiveSwitch noAlpha2("REGPU_NO_RESOLVE_ALPHA2");
         const uint32_t blitFlags = (toGamma ? 1u : 0u) | (!depth && destFormat == 7 && !noAlpha2 ? 2u : 0u);
-        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags, destRow);
+        [[maybe_unused]] const bool resolveRecorded = BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags, destRow);
+        // Diagnostic coverage for the opt-in size route. Only the actual
+        // clipped scissor of a recorded colour write can add evidence.
+        if (g_explicitFrame && !depth) {
+            auto& recorded=g_r.resolved[base];
+            const D3D12_RECT host=ToHost({rect.left, rect.top+destRow,
+                std::min<LONG>(rect.right,width),std::min<LONG>(rect.bottom+destRow,height)});
+            const auto clamp=[](LONG v,uint32_t n) { return uint32_t(std::clamp<int64_t>(v,0,n)); };
+            recorded.explicitCoverage.Record(reinterpret_cast<uintptr_t>(recorded.resource.Get()),g_r.frame,base,
+                recorded.hostWidth,recorded.hostHeight,clamp(host.left,recorded.hostWidth),
+                clamp(host.top,recorded.hostHeight),clamp(host.right,recorded.hostWidth),
+                clamp(host.bottom,recorded.hostHeight),resolveRecorded);
+        }
+        const bool postWindow=StockPostResolve::Enabled() && !C().worker && StockPostResolve::InWindow(g_r.frame) &&
+            C().list==&g_r.recorder && !RendererDrawWorkers();
+        if (postWindow && g_stockPost.quotaFrame!=g_r.frame) {
+            g_stockPost.quotaFrame=g_r.frame;
+            g_stockPost.perFrame=0;
+        }
+        const bool postSelect=postWindow && StockPostResolve::HasRoom(g_r.frame,g_stockPost.perFrame,g_stockPost.all) &&
+            resolveRecorded && !depth && control==0x00100000u && base==0x1CE2D000u && width==kWidth && height==kHeight &&
+            rect.left==0 && rect.top==0 && rect.right==LONG(kWidth) && rect.bottom==LONG(kHeight) &&
+            C().colorBase==0x005002D0u && C().depthBase==0;
+        const bool prePhase=g_explicitPhase;
+        const bool preScene=g_scenePhase;
+        const void* preImage=nullptr;
+        UINT preW=0,preH=0;
+        UINT64 preSerial=0;
+        if (postSelect) {
+            const auto& d=g_r.resolved.at(base);
+            preImage=d.resource.Get(); preW=d.hostWidth; preH=d.hostHeight; preSerial=d.serial;
+        }
+        const char* conversion="none";
+        TryPrivateAttachmentPair(resolveRecorded,depth,control,base,width,height,rect);
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
         if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
             CopySceneDepth(rect);
         // The main view's full image (its last tile reaches the bottom): the scene is done.
-        if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
-            UpscaleScene(base);
+        if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight)) {
+            if (g_explicitPhase) {
+                // Optional one-frame diagnostic control; the normal route is unchanged when unset.
+                const char* pairGate=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_FRAME");
+                const char* defer=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_DEFER");
+                char* end=nullptr; const uint64_t frame=pairGate ? strtoull(pairGate,&end,10) : 0;
+                if (!(defer && defer[0]=='1' && !defer[1] && frame && end && !*end &&
+                      (StockQueryCensus::Enabled() ? StockQueryCensus::InWindow(g_r.frame) : frame==g_r.frame)))
+                    conversion=ConvertExplicitScene(base,0) ? "explicit_recorded" : "explicit_refused";
+                else conversion="deferred";
+            } else { UpscaleScene(base); conversion="other_upscale"; }
+        }
+        // Publish only the successful stock full-target conversion, after its final shader-read barrier.
+        if (ConvertedOutput::Requested() && !C().worker && !RendererDrawWorkers() &&
+            (!g_convertedAttempted || (ConvertedOutput::RecurringBorrowRequested() && g_recurringRtv.ready)) &&
+            C().list==&g_r.recorder && !std::strcmp(conversion,"explicit_recorded") && resolveRecorded && !depth &&
+            base==0x1CE2D000u && control==0x00100000u && width==kWidth && height==kHeight &&
+            rect.left==0 && rect.top==0 && rect.right==LONG(kWidth) && rect.bottom==LONG(kHeight) &&
+            RequestedExplicitScene().width==2501 && RequestedExplicitScene().height==751 &&
+            C().colorBase==0x005002D0u && C().depthBase==0 && LeanFetch() && g_r.samplerHeap) {
+            auto& f=Frame();
+            auto& lease=f.converted;
+            const auto& d=g_r.resolved.at(base);
+            if ((!g_convertedAttempted || g_recurringRtv.CanStage(&lease,g_r.frame,g_resolveEpoch,d.serial)) &&
+                lease.state==ConvertedOutput::State::empty && f.explicitSlotActive[0] &&
+                d.frame==g_r.frame && d.serial && !d.stale && d.resource && d.resource.Get()==f.explicitTargets[0][0].Get() &&
+                d.format==DXGI_FORMAT_R8G8B8A8_UNORM && d.hostWidth==1920 && d.hostHeight==1080 &&
+                !g_explicitPhase && g_explicitFrame) {
+                lease.image=d.resource; lease.base=base; lease.serial=d.serial; lease.epoch=g_resolveEpoch;
+                lease.frame=g_r.frame; lease.draw=g_r.drawsThisFrame.load(); lease.width=d.hostWidth;
+                lease.height=d.hostHeight; lease.state=ConvertedOutput::State::pending;
+            }
+        }
+        if (postSelect) {
+            const auto& d=g_r.resolved.at(base);
+            auto& ticket=g_stockPost.live;
+            ticket.id=++g_stockPost.all; ticket.ordinal=++g_stockPost.perFrame;
+            ticket.frame=g_r.frame; ticket.draw=g_r.drawsThisFrame.load(); ticket.epoch=g_resolveEpoch; ticket.serial=d.serial;
+            ticket.color=C().color; ticket.depth=C().depth; ticket.publication=d.resource;
+            ticket.rtv=C().rtv; ticket.dsv=C().dsv; ticket.explicitFrame=g_explicitFrame; ticket.phase=g_explicitPhase;
+            Log("stock postresolve producer: id=%u frame=%llu ordinal=%u draw=%llu epoch=%llu base=%08X control=%08X colorBase=%08X depthBase=%08X color=%p depth=%p rtv=%llu dsv=%llu explicitFrame=%u prePhase=%u phase=%u preScene=%u scene=%u conversion=%s before=%p beforeSize=%ux%u preSerial=%llu after=%p afterSize=%ux%u serial=%llu",
+                ticket.id,ticket.frame,ticket.ordinal,ticket.draw,ticket.epoch,base,control,C().colorBase,C().depthBase,
+                (void*)ticket.color.Get(),(void*)ticket.depth.Get(),UINT64(ticket.rtv.ptr),UINT64(ticket.dsv.ptr),
+                UINT(g_explicitFrame),UINT(prePhase),UINT(g_explicitPhase),UINT(preScene),UINT(g_scenePhase),conversion,
+                preImage,preW,preH,preSerial,(void*)d.resource.Get(),d.hostWidth,d.hostHeight,d.serial);
+        }
         g_r.resolved[base].swapped = swapRB;
         g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
         g_r.resolved[base].plain8888 = !depth && destFormat == 6 && ((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF) == 0;
@@ -7134,7 +7789,51 @@ void Resolve()
         if (traceClears)
             Log("resolve clear: %08X rect %ld,%ld-%ld,%ld host %ld,%ld-%ld,%ld colour base %03X surface %08X worker %d", c, clearRect.left, clearRect.top, clearRect.right,
                 clearRect.bottom, hostClear.left, hostClear.top, hostClear.right, hostClear.bottom, C().colorBase, gpureg::Get(RB_SURFACE_INFO), int(C().worker));
+        if (ConvertedOutput::Requested() && !C().worker) Frame().converted.Cancel();
+        if (StockPostResolve::Enabled() && !C().worker) g_stockPost.Finish("intervening_color_clear");
         C().list->ClearRenderTargetView(C().rtv, color, 1, &hostClear);
+        // One isolated replay of this same clear, never rebinding or publishing the private pair.
+        auto& replay=Frame();
+        if(StockQueryCensus::Enabled() && !C().worker && replay.census.frame==g_r.frame) {
+            auto& n=replay.census.next;
+            if(n.ordinal && n.epoch==g_censusEpoch.load() && n.draw==g_r.drawsThisFrame.load() &&
+               n.colorBase==C().colorBase && n.depthBase==C().depthBase && n.color==C().color.Get() &&
+               n.depth==C().depth.Get() && (control&0x300)==0x100 && hostClear.left==0 && hostClear.top==0 &&
+               hostClear.right==LONG(n.width) && hostClear.bottom==LONG(n.height)) {
+                n.cleared=true;
+                StockQueryCensus::Inc(replay.census.clears);
+            }
+        }
+        if (replay.replayArmed) {
+            replay.replayArmed=false; // no retry, including on any failed identity/extent check
+            const bool valid=!C().worker && replay.replayFrame==g_r.frame && replay.replayDraw==g_r.drawsThisFrame.load() &&
+                replay.replayColorBase==C().colorBase && replay.replayDepthBase==C().depthBase &&
+                replay.replaySourceColor.Get()==C().color.Get() && replay.replaySourceDepth.Get()==C().depth.Get() &&
+                replay.replayColor && replay.replayDepth && replay.replayColor.Get()!=C().color.Get() && replay.replayDepth.Get()!=C().depth.Get() &&
+                (control&0x300)==0x100 && hostClear.left==0 && hostClear.top==0 &&
+                hostClear.right==LONG(replay.replayWidth) && hostClear.bottom==LONG(replay.replayHeight);
+            bool queued=false;
+            if (valid) {
+                const auto read=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition={replay.replayColor.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,read,D3D12_RESOURCE_STATE_RENDER_TARGET};
+                C().list->ResourceBarrier(1,&barrier);
+                const auto rtv=replay.privatePairRtv->GetCPUDescriptorHandleForHeapStart();
+                const D3D12_RECT outputClear{0,0,LONG(OutputWidth()),LONG(OutputHeight())};
+                C().list->ClearRenderTargetView(rtv,color,1,&outputClear);
+                barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;barrier.Transition.StateAfter=read;C().list->ResourceBarrier(1,&barrier);
+                const char* drawReplay=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_DRAW_REPLAY");
+                if (drawReplay && std::strcmp(drawReplay,"1")==0) {
+                    replay.replayDrawArmed=true; // snapshot after the immediately following eligible draw instead
+                } else {
+                    queued=replay.privatePairClearReadback.Record(g_r.device,C().list->Real(),C().color.Get(),C().depth.Get(),replay.replayColor.Get(),replay.replayDepth.Get(),
+                        replay.replayWidth,replay.replayHeight,OutputWidth(),OutputHeight(),g_r.frame,
+                        PrivatePairReadback::kMaxBytes-replay.privatePairReadback.bytes);
+                }
+            }
+            Log("private pair clear replay: frame=%llu valid=%u queued=%u bytes=%llu (isolated same-clear only; no adoption)",
+                (unsigned long long)g_r.frame,unsigned(valid),unsigned(queued),(unsigned long long)replay.privatePairClearReadback.bytes);
+        }
     }
     if ((control >> 9) & 1) // depth/stencil clear: depth 24 bits | stencil 8
     {
@@ -7148,6 +7847,8 @@ void Resolve()
             depth = std::clamp(depth, 0.0f, 1.0f);
         }
         const D3D12_RECT hostClear = ToHost(clearRect);
+        if (ConvertedOutput::Requested() && !C().worker) Frame().converted.Cancel();
+        if (StockPostResolve::Enabled() && !C().worker) g_stockPost.Finish("intervening_depth_clear");
         C().list->ClearDepthStencilView(C().dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &hostClear);
         // The EDRAM is one memory: a colour surface at the depth buffer's base is the same tiles, and a
         // whole-surface clear to zero leaves them zero (transparent black). The next colour surface
@@ -8591,7 +9292,10 @@ bool RendererParallelReady()
 {
     // REGPU_NO_DRAW_WORKERS: the pool stays, draws go serial (A/B live, "switch REGPU_NO_DRAW_WORKERS 1")
     static LiveSwitch off("REGPU_NO_DRAW_WORKERS");
-    return RendererDrawWorkers() > 0 && !off && g_r.ok && GameSettled() && GetSettings().upscaler == Settings::Upscaler::Off && !RendererTracing();
+    // This is tested before the first draw can open a frame. Reject at the
+    // configured-pair boundary, not only after g_explicitFrame becomes true.
+    const bool explicitConfigured=RequestedExplicitScene().width && GetSettings().upscaler==Settings::Upscaler::Off;
+    return RendererDrawWorkers() > 0 && !off && !explicitConfigured && g_r.ok && GameSettled() && GetSettings().upscaler == Settings::Upscaler::Off && !RendererTracing();
 }
 
 bool RendererIsResolveDraw()
@@ -9259,6 +9963,27 @@ bool DebugSkipDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    ConvertedOutput::Scope convertedDraw;
+    if (ConvertedOutput::Requested() && !C().worker && Frame().converted.Claim()) {
+        convertedDraw.owner=&Frame().converted;
+        convertedDraw.serial=convertedDraw.owner->serial;
+    }
+    StockPostResolve::DrawScope postDraw;
+    if (StockPostResolve::Enabled() && !C().worker && g_stockPost.live.id) {
+        if (g_stockPost.live.claimed) g_stockPost.Finish("nested_draw");
+        else {
+            g_stockPost.live.claimed=true;
+            postDraw.owner=&g_stockPost; postDraw.id=g_stockPost.live.id;
+        }
+    }
+    const UINT64 censusTicket=StockQueryCensus::Enabled() ? g_censusEpoch.fetch_add(1) : 0;
+    StockQueryCensus::NextDrawScope censusDraw;
+    if(StockQueryCensus::NoClear() && !C().worker) {
+        auto& c=Frame().census;
+        censusDraw.owner=&c; censusDraw.ordinal=c.active;
+        if(c.active && c.next.epoch!=censusTicket) c.Finish("intervening_recording_epoch");
+    }
+    ExplicitAliasDrawScope aliasScope;
     Section(0);
     if (DebugSkipDraw(initiator, dmaBase, dmaSize))
         return;
@@ -9474,6 +10199,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     BeginFrameIfNeeded();
     SelectSurfaces(false);
+    if (g_explicitPhase) {
+        const uint32_t surface=gpureg::Get(RB_SURFACE_INFO), ck=LayoutKey(surface), dk=DepthLayoutKey(surface);
+        const regpu::native_scene::AlternateViewEvidence e{
+            true,uint64_t(OutputWidth())*720==uint64_t(OutputHeight())*1280,!g_sw_REGPU_NO_MSAA_SCALE,
+            !ps.info.usedTextureSlots && !vs.info.usedTextureSlots,(gpureg::Get(RB_DEPTHCONTROL)&7)!=0,edramMode==5,
+            surface&0x3fff,(surface>>16)&3,prim,gpureg::Get(RB_COLOR_MASK),ck,
+            NativeSlot(ck).load(std::memory_order_relaxed),dk,NativeDepthSlot(dk).load(std::memory_order_relaxed),
+            gpureg::Get(PA_SC_WINDOW_SCISSOR_TL),gpureg::Get(PA_SC_WINDOW_SCISSOR_BR),gpureg::Get(PA_SC_WINDOW_OFFSET),
+            RegFloat(PA_CL_VPORT_XSCALE),RegFloat(PA_CL_VPORT_YSCALE),RegFloat(PA_CL_VPORT_XOFFSET),RegFloat(PA_CL_VPORT_YOFFSET)};
+        g_explicitPrimaryAliasDraw=regpu::native_scene::IsKnownPrimaryRectangle(e);
+    }
     // Temporal upscaling: the main view's draws in the scene also write motion vectors (their
     // shaders' motion variants, once compiled; until then the draw has no motion).
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
@@ -9483,11 +10219,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
     bool motion = mvs && mps && mvs->IsReady() && mps->IsReady();
     D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
-    ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : nullptr;
+    PipelineKey postKey;
+    PipelineKey* observeKey=(postDraw.id || (convertedDraw.owner && ConvertedOutput::PrivateColorRequested())) ? &postKey : nullptr;
+    ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex,false,observeKey) : nullptr;
     if (!pso)
     {
         motion = false;
-        pso = GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex);
+        pso = GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex,false,observeKey);
     }
     if (!pso)
     {
@@ -9927,6 +10665,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // Textures are bindless: each one has a permanent descriptor in the heap's
     // bindless region, and the draw passes its index in the constants.
     const uint32_t usedSlots = ps.info.usedTextureSlots | vs.info.usedTextureSlots;
+    const bool captureStockTextures=StockQueryCensus::FirstTextured() && !C().worker && g_r.frame==5043 &&
+        Frame().census.active==1 && Frame().census.next.epoch==censusTicket &&
+        C().colorBase==0x005002D0u && C().depthBase==0 &&
+        C().vsHash==0x5D606C137F9A8DDCull && C().psHash==0x9074C6D4CEDEBB8Eull &&
+        !vs.info.usedTextureSlots && ps.info.usedTextureSlots;
+    uint32_t stockFetchAddress[32]; // Only read for bits visited by the ordinary usedSlots loop.
     // Only the slots up to the highest used one reach the ring (below), unless whole blocks are copied:
     // clearing all 32 was 1 KB a draw (3.5% of the command processor in PGR4's races on an FX-8350).
     {
@@ -9945,6 +10689,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         const uint32_t slot = uint32_t(__builtin_ctz(m));
         const TextureFetch fetch = ReadTextureFetch(slot);
+        if(captureStockTextures || convertedDraw.owner) stockFetchAddress[slot]=fetch.Address();
         uint64_t bindingKey = 0xCBF29CE484222325ull;
         for (uint32_t d : fetch.dwords)
             bindingKey = (bindingKey ^ d) * 0x100000001B3ull;
@@ -10211,10 +10956,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     D3D12_RECT hostScissor = ToHost(scissor);
+    bool dsvDiscoveryClear=clearBefore;
     if (TileMerge::LaterClear& lc = TileMerge::g_laterClear; lc.pending[3] > lc.pending[1])
     {
         const D3D12_RECT rows = ToHost(D3D12_RECT{ lc.pending[0], lc.pending[1], lc.pending[2], lc.pending[3] });
         lc.pending[3] = lc.pending[1];
+        dsvDiscoveryClear |= lc.color || lc.depth;
         if (lc.color)
         {
             float color[4];
@@ -10247,11 +10994,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // A scissor narrower than the screen in a wide pass clips 2D content (a minimap),
     // which the vertex shader keeps in the centred 16:9 area: map it the same way. Not for
     // screen layers (post-processing done in halves would leave a seam).
-    if (WidePass() && ScaleWide() != ScaleY() && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(kWidth)))
+    if (WidePass() && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(kWidth)))
     {
-        const double centre = kWidth * ScaleWide() / 2.0, s = ScaleY();
-        hostScissor.left = LONG(std::lround(centre + (scissor.left - double(kWidth) / 2) * s));
-        hostScissor.right = LONG(std::lround(centre + (scissor.right - double(kWidth) / 2) * s));
+        if (g_explicitPhase) {
+            // Output aspect controls HUD squeeze; raster X/Y may differ independently.
+            if (ExplicitMainPixelEdges()) {
+                const double center=kWidth*double(ScaleWide())/2.0, xscale=double(ScaleWide())*vc->vwide[2];
+                hostScissor.left=regpu::native_scene::PixelCenterEdge(center+(scissor.left-double(kWidth)/2)*xscale);
+                hostScissor.right=regpu::native_scene::PixelCenterEdge(center+(scissor.right-double(kWidth)/2)*xscale);
+            } else {
+                hostScissor.left = regpu::native_scene::CenteredScissorX(scissor.left,kWidth,ScaleWide(),vc->vwide[2]);
+                hostScissor.right = regpu::native_scene::CenteredScissorX(scissor.right,kWidth,ScaleWide(),vc->vwide[2]);
+            }
+        } else if (ScaleWide() != ScaleY()) {
+            const double centre = kWidth * ScaleWide() / 2.0, s = ScaleY();
+            hostScissor.left = LONG(std::lround(centre + (scissor.left - double(kWidth) / 2) * s));
+            hostScissor.right = LONG(std::lround(centre + (scissor.right - double(kWidth) / 2) * s));
+        }
     }
     DrawState& ds = g_drawState;
     if (memcmp(&ds.viewport, &vp, sizeof(vp)) != 0)
@@ -10283,6 +11042,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             (gpureg::Get(RB_STENCILREFMASK) & 0xFF) == 0xFF && ((gpureg::Get(RB_COLOR_INFO) ^ gpureg::Get(RB_DEPTH_INFO)) & 0xFFF) == 0)
         {
             const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            dsvDiscoveryClear=true;
             C().list->ClearRenderTargetView(C().rtv, white, 1, &hostScissor);
         }
     }
@@ -10632,7 +11392,479 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
             C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
         }
-        issue();
+        auto& replay=Frame();
+        const bool armed=replay.replayDrawArmed;
+        const bool paired=armed && !C().worker && replay.pairedDrawDelta;
+        bool censusQuery=false;
+        bool commonDraw=false;
+        bool stockDsvDraw=false;
+        if(StockQueryCensus::Enabled() && !C().worker && replay.census.frame==g_r.frame) {
+            auto& c=replay.census;
+            const auto& n=c.next;
+            regpu::native_scene::ScissorRect mapped{};
+            const bool noClear=StockQueryCensus::NoClear();
+            const bool armedForDraw=noClear ? (c.active && n.ordinal==c.active) : n.cleared;
+            if(noClear && armedForDraw) {
+                auto& d=c.dispositions[c.active-1]; d.vs=C().vsHash; d.ps=C().psHash;
+            }
+            const auto check=[&](bool pass,const char* reason) {
+                if(!pass && noClear) c.Finish(reason);
+                return pass;
+            };
+            auto stockPsSlotsAllowed=[&] {
+                if(!StockQueryCensus::FirstTextured()) return !ps.info.usedTextureSlots;
+                if(!captureStockTextures) return false;
+                // Observe the final descriptor indices on both memo and cold binding paths.
+                // The table lookup copies only scalar identities; it never retains or rebinds a view.
+                struct Binding { UINT index; uintptr_t resource; UINT format,kind; };
+                Binding bindings[32]{};
+                {
+                    std::lock_guard lock(g_textureMutex);
+                    for(uint32_t bits=ps.info.usedTextureSlots;bits;bits&=bits-1) {
+                        const UINT slot=UINT(__builtin_ctz(bits));
+                        auto& b=bindings[slot];
+                        std::memcpy(&b.index,&pc->tbias[slot][1],sizeof(b.index));
+                        if(b.index<3) { b.kind=b.index; continue; }
+                        for(const auto& [key,entry]:g_r.bindless) {
+                            if(entry.index!=b.index) continue;
+                            b.resource=reinterpret_cast<uintptr_t>(entry.resource.Get());
+                            const UINT64 view=key^(UINT64(b.resource)<<8);
+                            b.format=UINT(view>>2);
+                            b.kind=UINT(view&3);
+                            break;
+                        }
+                    }
+                }
+                Log("stock first textured bindings: frame=%llu resolve=1 draw=%llu vsSlots=%08X psSlots=%08X epoch=%llu heap=%p rootTable=%llu",
+                    g_r.frame,n.draw,vs.info.usedTextureSlots,ps.info.usedTextureSlots,g_resolveEpoch,
+                    static_cast<void*>(g_r.srvHeap.Get()),ds.table3.ptr);
+                for(uint32_t bits=ps.info.usedTextureSlots;bits;bits&=bits-1) {
+                    const UINT slot=UINT(__builtin_ctz(bits)); const auto& b=bindings[slot];
+                    const char* lookup=b.index<3 ? "null" : b.resource ? "known" : "unknown";
+                    Log("stock first textured slot: frame=%llu resolve=1 draw=%llu slot=%u guest=%08X index=%u state=%s resource=%llX format=%u kind=%u colorAlias=%u depthAlias=%u",
+                        g_r.frame,n.draw,slot,stockFetchAddress[slot],b.index,lookup,UINT64(b.resource),b.format,b.kind,
+                        unsigned(b.resource && b.resource==reinterpret_cast<uintptr_t>(n.color)),
+                        unsigned(b.resource && b.resource==reinterpret_cast<uintptr_t>(n.depth)));
+                }
+                return true;
+            };
+            if (StockQueryCensus::DsvDiscovery()) {
+                static bool attempted=false;
+                if (armedForDraw && n.ordinal==2 && !attempted) {
+                    attempted=true;
+                    auto& w=replay.stockDsv;
+                    const auto prepare=[&]() -> const char* {
+                        if (w.recorded || armed || paired || C().list!=&g_r.recorder || RendererDrawWorkers() || g_occlusionOpen || coveragePso ||
+                            motion || ds.motionTargets || ds.motionRoot || ds.pso!=pso || !pso) return "stock_draw_state";
+                        if (dsvDiscoveryClear || vp.TopLeftX!=0 || vp.TopLeftY!=0 || vp.Width!=float(n.width) ||
+                            vp.Height!=float(n.height) || hostScissor.right>LONG(n.width) || hostScissor.bottom>LONG(n.height))
+                            return "clear_or_scene_extent";
+                        if (n.cleared || n.epoch!=censusTicket || g_censusEpoch.load()!=censusTicket+1 ||
+                            n.draw!=g_r.drawsThisFrame.load() || n.base!=0x1CE2D000u || n.colorBase!=0x005002D0u ||
+                            n.depthBase!=0 || n.colorBase!=C().colorBase || n.depthBase!=C().depthBase ||
+                            !g_explicitFrame || !g_explicitPhase || g_msaa!=1) return "resolve_ticket";
+                        if (C().vsHash!=StockDsvWitness::vs || C().psHash!=StockDsvWitness::ps ||
+                            (gpureg::Get(RB_COLOR_MASK)&15u)) return "shader_or_color_write";
+                        {
+                            std::lock_guard lock(g_surfaceMutex);
+                            auto z=g_r.depthSurfaces.find(n.depthBase), color=g_r.colorSurfaces.find(n.colorBase);
+                            if (z==g_r.depthSurfaces.end() || color==g_r.colorSurfaces.end() || !n.depth || !n.color ||
+                                n.color!=C().color.Get() || n.depth!=C().depth.Get() || n.depth==n.color ||
+                                z->second.resource.Get()!=n.depth || color->second.resource.Get()!=n.color ||
+                                z->second.state!=D3D12_RESOURCE_STATE_DEPTH_WRITE || !C().dsv.ptr ||
+                                z->second.view.ptr!=C().dsv.ptr || color->second.view.ptr!=C().rtv.ptr ||
+                                C().colorState!=D3D12_RESOURCE_STATE_RENDER_TARGET) return "draw_attachment";
+                        }
+                        if (!w.Prepare(g_r.device,n.depth,pso,hostScissor)) {
+                            w={};
+                            return "effective_pso_or_footprint_or_allocation";
+                        }
+                        w.frame=g_r.frame;
+                        w.draw=n.draw;
+                        stockDsvDraw=true;
+                        return "stock_dsv_bracket";
+                    };
+                    c.Finish(prepare());
+                } else if (armedForDraw) c.Finish("outside_single_ordinal2_attempt");
+            } else if(armedForDraw && check(n.epoch==censusTicket,"ticket") &&
+               check(g_censusEpoch.load()==censusTicket+1,"intervening_recording_epoch") &&
+               check(n.draw==g_r.drawsThisFrame.load(),"draw_ordinal") && check(n.colorBase==C().colorBase,"color_base") &&
+               check(n.depthBase==C().depthBase,"depth_base") && check(n.color==C().color.Get(),"color_identity") &&
+               check(n.depth==C().depth.Get(),"depth_identity") && check(g_explicitFrame && g_explicitPhase,"explicit_phase") &&
+               check(g_msaa==1,"samples") && check(C().colorState==D3D12_RESOURCE_STATE_RENDER_TARGET,"color_state") &&
+               check((gpureg::Get(RB_COLOR_MASK)&15u)!=0,"color_writes") && check(!g_occlusionOpen,"guest_query") &&
+               check(!coveragePso,"coverage_pso") && check(!motion,"motion") && check(!vs.info.memExport,"vs_memexport") &&
+               check(!ps.info.memExport,"ps_memexport") && check(!vs.info.usedTextureSlots,"vs_textures") &&
+               check(stockPsSlotsAllowed(),StockQueryCensus::FirstTextured() ? "textured_signature" : "ps_textures") && check(pc->info[1]==0xff,"pixel_input") &&
+               check(!(pc->info[2]&64u),"pixel_flags") &&
+               check(vp.TopLeftX==0 && vp.TopLeftY==0 && vp.Width==float(n.width) && vp.Height==float(n.height),"viewport") &&
+               check(regpu::native_scene::MapPrivateScissor({hostScissor.left,hostScissor.top,hostScissor.right,hostScissor.bottom},
+                   {n.width,n.height},{OutputWidth(),OutputHeight()},mapped),"scissor")) {
+                StockQueryCensus::Inc(c.eligible);
+                if(StockQueryCensus::CommonGrid()) {
+                    auto& grid=replay.common;
+                    auto prepare=[&]() -> const char* {
+                        if(!captureStockTextures || vs.info.usedTextureSlots || ps.info.usedTextureSlots!=2 ||
+                           stockFetchAddress[1]!=n.base || !grid.primary || grid.epoch!=g_resolveEpoch ||
+                           grid.frame!=g_r.frame || g_bindingsFrame!=g_r.frame || g_bindingsEpoch!=grid.epoch ||
+                           !grid.serial || grid.recorded || armed || paired ||
+                           g_occlusionOpen || coveragePso || RendererDrawWorkers()) return "common_draw_identity";
+                        const bool dynamicLease=CommonSamplerLeaseRequested() && LeanFetch() && g_r.samplerHeap;
+                        if((!dynamicLease && (LeanFetch() || g_r.samplerHeap)) || !g_r.rootSignature || !g_r.srvHeap ||
+                           ds.motionRoot || ds.motionTargets || ds.pso!=pso ||
+                           ds.table3.ptr!=Gpu(g_r.srvHeap.Get(),kBindlessBase,g_r.srvStride).ptr) return "common_root_table";
+                        if(n.width!=grid.width || n.height!=grid.height || vp.TopLeftX!=0 || vp.TopLeftY!=0 ||
+                           vp.Width!=float(grid.width) || vp.Height!=float(grid.height) ||
+                           hostScissor.left || hostScissor.top || hostScissor.right!=LONG(grid.width) ||
+                           hostScissor.bottom!=LONG(grid.height)) return "common_grid";
+                        const auto rt=g_r.resolved.find(n.base);
+                        if(rt==g_r.resolved.end() || rt->second.stale || rt->second.resource.Get()!=grid.primary.Get() ||
+                           rt->second.serial!=grid.serial || rt->second.frame!=g_r.frame ||
+                           !rt->second.explicitCoverage.Complete(reinterpret_cast<uintptr_t>(grid.primary.Get()),
+                               g_r.frame,n.base,rt->second.hostWidth,rt->second.hostHeight)) return "common_primary_generation";
+                        const auto d=grid.primary->GetDesc();
+                        if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Format!=DXGI_FORMAT_R8G8B8A8_UNORM ||
+                           d.MipLevels!=1 || d.DepthOrArraySize!=1 || d.SampleDesc.Count!=1 || d.SampleDesc.Quality ||
+                           rt->second.format!=d.Format || rt->second.hostWidth!=d.Width || rt->second.hostHeight!=d.Height ||
+                           grid.primary.Get()==n.color || grid.primary.Get()==n.depth) return "common_primary_view";
+                        std::memcpy(&grid.descriptor,&pc->tbias[1][1],sizeof(grid.descriptor));
+                        const auto heapDesc=g_r.srvHeap->GetDesc();
+                        if(heapDesc.Type!=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+                           !(heapDesc.Flags&D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || grid.descriptor>=kBindless ||
+                           UINT64(kBindlessBase)+grid.descriptor>=heapDesc.NumDescriptors) return "common_heap_bounds";
+                        {
+                            std::lock_guard lock(g_textureMutex);
+                            const UINT64 key=(UINT64(reinterpret_cast<uintptr_t>(grid.primary.Get()))<<8) ^
+                                              (UINT64(DXGI_FORMAT_R8G8B8A8_UNORM)<<2);
+                            const auto e=g_r.bindless.find(key);
+                            if(grid.descriptor<3 || e==g_r.bindless.end() || e->second.index!=grid.descriptor ||
+                               e->second.resource.Get()!=grid.primary.Get() || e->second.lastFrame!=g_r.frame)
+                                return "common_bound_srv";
+                        }
+                        grid.draw=n.draw;grid.table=ds.table3.ptr;grid.srvHeap=g_r.srvHeap;grid.root=g_r.rootSignature;
+                        if(!grid.Prepare(g_r.device,n.color,n.depth)) return "common_allocation_or_layout";
+                        if(dynamicLease && !PrepareCommonSamplerLease(grid,ds.samplers)) return "common_sampler_lease";
+                        return nullptr;
+                    };
+                    const char* reason=prepare();
+                    if(reason) { c.Finish(reason); if(!grid.recorded) grid={}; }
+                    else {
+                        commonDraw=true;
+                        if(grid.samplerLease) {
+                            C().list->SetGraphicsRootDescriptorTable(4,grid.samplerImmutable);
+                            ds.samplers=grid.samplerImmutable;
+                            Log("common sampler lease: frame=%llu draw=%llu bank=%u serial=%llu original=%llu immutable=%llu heap=%p",
+                                grid.frame,grid.draw,grid.samplerBank,grid.samplerSerial,grid.samplerOriginal.ptr,
+                                grid.samplerImmutable.ptr,static_cast<void*>(grid.samplerHeap.Get()));
+                        }
+                        grid.Seed(*C().list);
+                        C().list->BeginQuery(grid.samples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);
+                    }
+                } else if(g_censusQueries<StockQueryCensus::kMax && c.count<StockQueryCensus::kMax && c.Allocate(g_r.device)) {
+                    c.rows[c.count]={n.draw,C().vsHash,C().psHash,n.ordinal,n.base,n.colorBase,n.depthBase,n.width,n.height,
+                        hostScissor,{mapped.left,mapped.top,mapped.right,mapped.bottom}};
+                    censusQuery=true;
+                    C().list->BeginQuery(c.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,c.count);
+                } else if(noClear) c.Finish("query_allocation_or_limit");
+            }
+            c.next={};
+        }
+        auto bindConvertedSamplers=[&]() {
+            auto& lease=*convertedDraw.owner;
+            if (lease.state!=ConvertedOutput::State::claimed || lease.serial!=convertedDraw.serial ||
+                lease.epoch!=g_resolveEpoch || lease.frame!=g_r.frame || lease.draw!=g_r.drawsThisFrame.load() ||
+                !g_explicitFrame || g_explicitPhase || !Frame().explicitSlotActive[0] ||
+                lease.image.Get()!=Frame().explicitTargets[0][0].Get() || C().list!=&g_r.recorder || RendererDrawWorkers() ||
+                C().colorBase!=0x005002D0u || C().depthBase!=0 || !C().color || !C().depth ||
+                lease.image.Get()==C().color.Get() || lease.image.Get()==C().depth.Get() || g_msaa!=1 ||
+                !LeanFetch() || !g_r.samplerHeap || !g_r.srvHeap || !g_r.rootSignature || ds.pso!=pso || !pso ||
+                motion || ds.motionRoot || ds.motionTargets || dsvDiscoveryClear || armed || paired || coveragePso ||
+                commonDraw || stockDsvDraw || censusQuery || g_occlusionOpen || vs.info.memExport || ps.info.memExport ||
+                C().vsHash!=0x5D606C137F9A8DDCull || C().psHash!=0x9074C6D4CEDEBB8Eull ||
+                vs.info.usedTextureSlots || ps.info.usedTextureSlots!=2 || stockFetchAddress[1]!=lease.base ||
+                vp.TopLeftX || vp.TopLeftY ||
+                vp.Width!=float(lease.width) || vp.Height!=float(lease.height) || hostScissor.left || hostScissor.top ||
+                hostScissor.right!=LONG(lease.width) || hostScissor.bottom!=LONG(lease.height) ||
+                ds.table3.ptr!=Gpu(g_r.srvHeap.Get(),kBindlessBase,g_r.srvStride).ptr ||
+                g_bindingsFrame!=g_r.frame || g_bindingsEpoch!=lease.epoch) return false;
+            const auto publication=g_r.resolved.find(lease.base);
+            if (publication==g_r.resolved.end()) return false;
+            const auto& d=publication->second;
+            const auto image=lease.image->GetDesc();
+            if (d.resource.Get()!=lease.image.Get() || d.serial!=lease.serial || d.frame!=lease.frame || d.stale ||
+                d.hostWidth!=lease.width || d.hostHeight!=lease.height || d.format!=DXGI_FORMAT_R8G8B8A8_UNORM ||
+                image.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || image.Format!=d.format || image.DepthOrArraySize!=1 ||
+                image.MipLevels!=1 || image.SampleDesc.Count!=1 || image.SampleDesc.Quality ||
+                image.Width!=lease.width || image.Height!=lease.height) return false;
+            UINT descriptor;
+            std::memcpy(&descriptor,&pc->tbias[1][1],sizeof(descriptor));
+            const auto heap=g_r.srvHeap->GetDesc();
+            if (descriptor<3 || descriptor>=kBindless || heap.Type!=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+                !(heap.Flags&D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || UINT64(kBindlessBase)+descriptor>=heap.NumDescriptors)
+                return false;
+            {
+                std::unique_lock lock(g_textureMutex,std::try_to_lock);
+                if (!lock.owns_lock()) return false;
+                const auto key=(UINT64(reinterpret_cast<uintptr_t>(lease.image.Get()))<<8) ^ (UINT64(image.Format)<<2);
+                const auto i=g_r.bindless.find(key);
+                if (i==g_r.bindless.end() || i->second.index!=descriptor || i->second.resource.Get()!=lease.image.Get() ||
+                    i->second.lastFrame!=g_r.frame) return false;
+            }
+            g_convertedAttempted=true;
+            if (!PrepareCommonSamplerLease(lease,ds.samplers,ConvertedOutput::RecurringBorrowRequested())) return false;
+            lease.srvHeap=g_r.srvHeap; lease.descriptor=descriptor; lease.state=ConvertedOutput::State::bound;
+            C().list->SetGraphicsRootDescriptorTable(4,lease.samplerImmutable);
+            return true;
+        };
+        const bool boundConverted=convertedDraw.owner && bindConvertedSamplers();
+        if (stockDsvDraw) replay.stockDsv.Snapshot(*C().list,0);
+        const bool privateRequested=boundConverted && ConvertedOutput::PrivateColorRequested();
+        auto preparePrivateColor=[&]() -> const char* {
+            if (!observeKey || C().colorState!=D3D12_RESOURCE_STATE_RENDER_TARGET ||
+                !g_r.rtvHeap || !g_r.dsvHeap || !C().rtv.ptr || !C().dsv.ptr) return "om_state";
+            {
+                std::unique_lock lock(g_shaderMutex,std::try_to_lock);
+                if (!lock.owns_lock()) return "pipeline_busy";
+                const auto i=g_r.pipelines.find(postKey);
+                if (i==g_r.pipelines.end() || i->second->state.load(std::memory_order_acquire)!=1 ||
+                    i->second->pso.Get()!=pso || ds.pso!=pso ||
+                    !ConvertedPrivateColor::AcceptState(i->second->postState)) return "effective_pso";
+            }
+            {
+                std::unique_lock lock(g_surfaceMutex,std::try_to_lock);
+                if (!lock.owns_lock()) return "surface_busy";
+                const auto c=g_r.colorSurfaces.find(C().colorBase),z=g_r.depthSurfaces.find(C().depthBase);
+                if (c==g_r.colorSurfaces.end() || z==g_r.depthSurfaces.end() ||
+                    c->second.resource.Get()!=C().color.Get() || z->second.resource.Get()!=C().depth.Get() ||
+                    c->second.view.ptr!=C().rtv.ptr || z->second.view.ptr!=C().dsv.ptr ||
+                    z->second.state!=D3D12_RESOURCE_STATE_DEPTH_WRITE) return "attachments";
+            }
+            ConvertedPrivateColor temp;
+            const bool recurring=ConvertedOutput::RecurringBorrowRequested();
+            const bool reuse=recurring && g_recurringRtv.retired;
+            if (const char* reason=temp.Prepare(g_r.device,C().color.Get(),C().depth.Get(),g_r.rtvHeap.Get(),g_r.dsvHeap.Get(),
+                                C().rtv,C().dsv,hostScissor,ConvertedOutput::BorrowedColorRequested(),recurring,
+                                reuse ? g_recurringRtv.rtv.Get() : nullptr,reuse ? &g_recurringRtv.heapReceipt : nullptr)) return reason;
+            if (ConvertedOutput::PrivateColorOracleRequested() &&
+                !convertedDraw.owner->colorOracle.Prepare(g_r.device,temp)) return "oracle_allocation";
+            convertedDraw.owner->privateColor=std::move(temp);
+            return nullptr;
+        };
+        const char* privateRefusal=privateRequested ? preparePrivateColor() : nullptr;
+        const bool privateStored=privateRequested && !privateRefusal;
+        if (privateStored) {
+            auto& color=convertedDraw.owner->privateColor;
+            auto candidate=[&] {
+                const auto view=color.rtv->GetCPUDescriptorHandleForHeapStart();
+                if (color.borrowed) {
+                    ConvertedPrivateColor::RecordBorrowed(*C().list,g_r.device,color.stock.Get(),
+                        color.stockView,view,color.depthView,issue);
+                } else {
+                    ConvertedPrivateColor::Record(*C().list,color.stock.Get(),color.image.Get(),color.stockView,
+                        view,color.depthView,color.roi,issue);
+                }
+            };
+            if (ConvertedOutput::PrivateColorOracleRequested()) {
+                auto& owner=*convertedDraw.owner;
+                owner.colorOracle.Record(*C().list,color,candidate,[&] {
+                    C().list->SetGraphicsRootDescriptorTable(4,owner.samplerOriginal);
+                    issue();
+                });
+            } else candidate();
+        } else if (!paired) {
+            if (privateRequested && (ConvertedOutput::PrivateColorOracleRequested() || ConvertedOutput::RecurringBorrowRequested()))
+                C().list->SetGraphicsRootDescriptorTable(4,convertedDraw.owner->samplerOriginal);
+            issue();
+        }
+        const bool detailConverted=boundConverted &&
+            (!ConvertedOutput::RecurringBorrowRequested() || g_recurringRtv.DetailNext());
+        if (privateRequested && detailConverted) {
+            const auto& lease=*convertedDraw.owner;
+            Log("converted private color: frame=%llu draw=%llu serial=%llu status=%s stock=%p private=%p depth=%p roi=%ld,%ld,%ld,%ld",
+                lease.frame,lease.draw,lease.serial,privateStored ? (lease.privateColor.borrowed ? "borrowed_issued" : "store_recorded") : privateRefusal,
+                (void*)C().color.Get(),(void*)lease.privateColor.image.Get(),(void*)C().depth.Get(),
+                hostScissor.left,hostScissor.top,hostScissor.right,hostScissor.bottom);
+            if (privateStored && ConvertedOutput::RecurringBorrowRequested())
+                Log("converted recurring borrowed RTV: frame=%llu draw=%llu serial=%llu ordinal=%llu previousFence=%llu rtvHeap=%p samplerHeap=%p writer=%llu nodeMask=%u",
+                    lease.frame,lease.draw,lease.serial,g_recurringRtv.retired+1,g_recurringRtv.fence,
+                    (void*)lease.privateColor.rtv.Get(),(void*)lease.samplerHeap.Get(),lease.samplerSerial,lease.privateColor.heapReceipt.desc.NodeMask);
+        }
+        if (boundConverted) {
+            const auto& lease=*convertedDraw.owner;
+            C().list->SetGraphicsRootDescriptorTable(4,lease.samplerOriginal);
+            if (detailConverted) Log("converted output sampler used: frame=%llu draw=%llu epoch=%llu serial=%llu base=%08X image=%p size=%ux%u srv=%u samplerBank=%u samplerSerial=%llu original=%llu immutable=%llu",
+                lease.frame,lease.draw,lease.epoch,lease.serial,lease.base,(void*)lease.image.Get(),lease.width,lease.height,
+                lease.descriptor,lease.samplerBank,lease.samplerSerial,lease.samplerOriginal.ptr,lease.samplerImmutable.ptr);
+        }
+        if (postDraw.id && g_stockPost.live.id==postDraw.id) {
+            const auto& t=g_stockPost.live;
+            if (!paired && !privateStored) Log("stock postresolve draw: id=%u frame=%llu draw=%llu actualFrame=%llu actualDraw=%u epoch=%llu vs=%016llX ps=%016llX pso=%p phase=%u color=%p depth=%p rtv=%llu dsv=%llu viewport=%g,%g,%g,%g roi=%ld,%ld,%ld,%ld",
+                t.id,t.frame,t.draw,g_r.frame,g_r.drawsThisFrame.load(),g_resolveEpoch,C().vsHash,C().psHash,
+                (void*)ds.pso,UINT(g_explicitPhase),(void*)C().color.Get(),(void*)C().depth.Get(),UINT64(C().rtv.ptr),UINT64(C().dsv.ptr),
+                vp.TopLeftX,vp.TopLeftY,vp.Width,vp.Height,hostScissor.left,hostScissor.top,hostScissor.right,hostScissor.bottom);
+            auto inspect=[&]() -> const char* {
+                if (privateStored || paired || armed || motion || ds.motionTargets || ds.motionRoot || coveragePso || g_occlusionOpen ||
+                    dsvDiscoveryClear || ds.pso!=pso || !pso || C().list!=&g_r.recorder) return "alternate_or_clear";
+                if (t.frame!=g_r.frame || t.draw!=g_r.drawsThisFrame.load() || t.epoch!=g_resolveEpoch ||
+                    t.phase!=g_explicitPhase || t.explicitFrame!=g_explicitFrame) return "draw_epoch";
+                const auto publication=g_r.resolved.find(0x1CE2D000u);
+                if (!t.publication || !t.serial || publication==g_r.resolved.end() ||
+                    publication->second.resource.Get()!=t.publication.Get() || publication->second.serial!=t.serial)
+                    return "publication_changed";
+                if (!t.color || !t.depth || !t.dsv.ptr || !t.rtv.ptr || t.depth.Get()==t.color.Get() ||
+                    t.depth.Get()!=C().depth.Get() || t.color.Get()!=C().color.Get() || t.dsv.ptr!=C().dsv.ptr ||
+                    t.rtv.ptr!=C().rtv.ptr || C().colorBase!=0x005002D0u || C().depthBase!=0 ||
+                    C().colorState!=D3D12_RESOURCE_STATE_RENDER_TARGET) return "attachment_changed";
+                {
+                    std::unique_lock lock(g_surfaceMutex,std::try_to_lock);
+                    if (!lock.owns_lock()) return "surface_busy";
+                    const auto c=g_r.colorSurfaces.find(C().colorBase), z=g_r.depthSurfaces.find(C().depthBase);
+                    if (c==g_r.colorSurfaces.end() || z==g_r.depthSurfaces.end() || c->second.resource.Get()!=t.color.Get() ||
+                        z->second.resource.Get()!=t.depth.Get() || c->second.view.ptr!=t.rtv.ptr ||
+                        z->second.view.ptr!=t.dsv.ptr || z->second.state!=D3D12_RESOURCE_STATE_DEPTH_WRITE) return "surface_map";
+                }
+                UINT state=0,faces=0;
+                {
+                    std::unique_lock lock(g_shaderMutex,std::try_to_lock);
+                    if (!lock.owns_lock()) return "pipeline_busy";
+                    const auto i=g_r.pipelines.find(postKey);
+                    if (i==g_r.pipelines.end() || i->second->state.load(std::memory_order_acquire)!=1 ||
+                        i->second->pso.Get()!=pso || !i->second->postState) return "effective_pso_unavailable";
+                    state=i->second->postState; faces=i->second->postFaces;
+                }
+                const auto z=t.depth->GetDesc(), c=t.color->GetDesc();
+                if (z.Format!=DXGI_FORMAT_R32G8X24_TYPELESS || !(z.Flags&D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+                    c.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT || !(c.Flags&D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+                    z.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || c.Dimension!=z.Dimension || z.DepthOrArraySize!=1 ||
+                    c.DepthOrArraySize!=1 || z.MipLevels!=1 || c.MipLevels!=1 || z.SampleDesc.Count!=1 || c.SampleDesc.Count!=1 ||
+                    !C().vsHash || !C().psHash || hostScissor.left<0 || hostScissor.top<0 ||
+                    hostScissor.left>=hostScissor.right || hostScissor.top>=hostScissor.bottom ||
+                    UINT64(hostScissor.right)>std::min(z.Width,c.Width) || UINT(hostScissor.bottom)>std::min(z.Height,c.Height))
+                    return "attachment_extent";
+                if (!(vp.Width>0 && vp.Height>0 && vp.TopLeftX<hostScissor.right && vp.TopLeftY<hostScissor.bottom &&
+                      vp.TopLeftX+vp.Width>hostScissor.left && vp.TopLeftY+vp.Height>hostScissor.top)) return "viewport_roi";
+                Log("stock postresolve issued: id=%u frame=%llu draw=%llu epoch=%llu serial=%llu vs=%016llX ps=%016llX pso=%p state=%08X faces=%08X planes=%u depth=%p color=%p dsv=%llu rtv=%llu zSize=%llux%u cSize=%llux%u viewport=%g,%g,%g,%g roi=%ld,%ld,%ld,%ld phase=%u",
+                    t.id,t.frame,t.draw,t.epoch,t.serial,C().vsHash,C().psHash,(void*)pso,state,faces,state&3,
+                    (void*)t.depth.Get(),(void*)t.color.Get(),UINT64(t.dsv.ptr),UINT64(t.rtv.ptr),z.Width,z.Height,c.Width,c.Height,
+                    vp.TopLeftX,vp.TopLeftY,vp.Width,vp.Height,hostScissor.left,hostScissor.top,hostScissor.right,hostScissor.bottom,UINT(t.phase));
+                return (state&3) ? "writable_pso" : "readonly_pso";
+            };
+            g_stockPost.Finish(inspect());
+        }
+        if (stockDsvDraw) {
+            replay.stockDsv.Snapshot(*C().list,1);
+            replay.stockDsv.recorded=true;
+        }
+        if(commonDraw) {
+            auto& grid=replay.common;
+            C().list->EndQuery(grid.samples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);
+            const auto rtv=grid.rtv->GetCPUDescriptorHandleForHeapStart(),dsv=grid.dsv->GetCPUDescriptorHandleForHeapStart();
+            C().list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
+            C().list->BeginQuery(grid.samples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,1);
+            issue();
+            C().list->EndQuery(grid.samples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,1);
+            C().list->OMSetRenderTargets(1,&C().rtv,FALSE,&C().dsv);
+            C().list->ResolveQueryData(grid.samples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,0,2,grid.samples.readback.Get(),0);
+            grid.samples.resolved=true;
+            grid.CaptureStock(*C().list,2);grid.CapturePrivate(*C().list,3);
+            grid.recorded=true;
+            if(grid.samplerLease) {
+                C().list->SetGraphicsRootDescriptorTable(4,grid.samplerOriginal);
+                ds.samplers=grid.samplerOriginal;
+            }
+            replay.census.Finish("common_recorded");
+        }
+        if(censusQuery) {
+            auto& c=replay.census;
+            C().list->EndQuery(c.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,c.count);
+            C().list->ResolveQueryData(c.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,c.count,1,c.buffer.Get(),c.count*sizeof(UINT64));
+            ++c.count; ++g_censusQueries;
+            if(StockQueryCensus::NoClear()) c.Finish("queried");
+        }
+        // One isolated replay of the next actual draw, with a private attachment pair.
+        // This is an experiment, not an ownership or HUD transition.
+        if (armed) {
+            replay.replayDrawArmed=false;
+            regpu::native_scene::ScissorRect mappedScissor{};
+            const bool scissorOk=regpu::native_scene::MapPrivateScissor(
+                {hostScissor.left,hostScissor.top,hostScissor.right,hostScissor.bottom},
+                {replay.replayWidth,replay.replayHeight},{OutputWidth(),OutputHeight()},mappedScissor);
+            // One bounded explanation, from the same already-loaded draw values; no new guest reads.
+            const bool identityOk=!C().worker && replay.replayFrame==g_r.frame && replay.replayDraw==g_r.drawsThisFrame.load() &&
+                replay.replayColorBase==C().colorBase && replay.replayDepthBase==C().depthBase &&
+                replay.replaySourceColor.Get()==C().color.Get() && replay.replaySourceDepth.Get()==C().depth.Get() &&
+                replay.replayColor && replay.replayDepth && replay.replayColor.Get()!=C().color.Get() && replay.replayDepth.Get()!=C().depth.Get();
+            const bool phaseOk=g_explicitPhase && g_msaa==1 && C().colorState==D3D12_RESOURCE_STATE_RENDER_TARGET && (gpureg::Get(RB_COLOR_MASK)&15u);
+            const bool effectsOk=!g_occlusionOpen && !coveragePso && !motion && !vs.info.memExport && !ps.info.memExport;
+            const bool texturesOk=!vs.info.usedTextureSlots && !ps.info.usedTextureSlots;
+            const bool pixelOk=pc->info[1]==0xff && !(pc->info[2]&64u);
+            const bool viewportOk=vp.TopLeftX==0 && vp.TopLeftY==0 && vp.Width==float(replay.replayWidth) && vp.Height==float(replay.replayHeight);
+            const bool valid=identityOk && phaseOk && effectsOk && texturesOk && pixelOk && viewportOk && scissorOk;
+            Log("private pair draw reason: frame=%llu draw=%llu valid=%u identity=%u phase=%u effects=%u textures=%u pixel=%u viewport=%u scissor=%u vs=%016llX ps=%016llX vsSlots=%08X psSlots=%08X pixelInput=%u infoFlags=%08X viewportXYWH=%g,%g,%g,%g scissorLTRB=%ld,%ld,%ld,%ld privateScissorLTRB=%d,%d,%d,%d",
+                (unsigned long long)g_r.frame,(unsigned long long)g_r.drawsThisFrame.load(),unsigned(valid),unsigned(identityOk),unsigned(phaseOk),unsigned(effectsOk),unsigned(texturesOk),unsigned(pixelOk),unsigned(viewportOk),unsigned(scissorOk),
+                (unsigned long long)C().vsHash,(unsigned long long)C().psHash,vs.info.usedTextureSlots,ps.info.usedTextureSlots,pc->info[1],pc->info[2],vp.TopLeftX,vp.TopLeftY,vp.Width,vp.Height,hostScissor.left,hostScissor.top,hostScissor.right,hostScissor.bottom,mappedScissor.left,mappedScissor.top,mappedScissor.right,mappedScissor.bottom);
+            bool beforeReady=false;
+            bool countSamples=false;
+            if (paired) {
+                if (valid) {
+                    replay.pairedStockRect=hostScissor;
+                    replay.pairedOutputRect={mappedScissor.left,mappedScissor.top,mappedScissor.right,mappedScissor.bottom};
+                    // The clear has run. Record restores all four resource states
+                    // before the authoritative stock draw on this command list.
+                    beforeReady=replay.privatePairReadback.Record(g_r.device,C().list->Real(),
+                        C().color.Get(),C().depth.Get(),replay.replayColor.Get(),replay.replayDepth.Get(),
+                        replay.replayWidth,replay.replayHeight,OutputWidth(),OutputHeight(),g_r.frame,
+                        PrivatePairReadback::kMaxBytes/2);
+                }
+                if (beforeReady && replay.privateSamples.requested &&
+                    replay.privatePairReadback.bytes<=(PrivatePairReadback::kMaxBytes-PrivatePassedSamples::kBytes)/2)
+                    countSamples=replay.privateSamples.Allocate(g_r.device);
+                if (countSamples) C().list->BeginQuery(replay.privateSamples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);
+                issue();
+                if (countSamples) C().list->EndQuery(replay.privateSamples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);
+            }
+            bool queued=false;
+            if(valid && (!paired || beforeReady)) {
+                const auto read=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                const D3D12_RECT outScissor{mappedScissor.left,mappedScissor.top,mappedScissor.right,mappedScissor.bottom};
+                const UINT64 firstBytes = replay.privatePairReadback.bytes;
+                const char* delta = getenv("REGPU_NATIVE_SCENE_PRIVATE_DRAW_DELTA");
+                if (!paired && delta && std::strcmp(delta,"1")==0) {
+                    // The after snapshot uses the same four resource descriptions as the first.
+                    // Reserve room for both full snapshots before requesting the small box.
+                    const UINT64 available = firstBytes <= PrivatePairReadback::kMaxBytes / 2
+                        ? PrivatePairReadback::kMaxBytes - firstBytes * 2 : 0;
+                    if (!replay.privateDrawColorBefore.Record(g_r.device, C().list->Real(),
+                            replay.replayColor.Get(), outScissor, g_r.frame, replay.replayDraw, available))
+                        Log("private draw color delta: frame=%llu draw=%llu beforeUnavailable=1 availableBytes=%llu",
+                            (unsigned long long)g_r.frame, (unsigned long long)replay.replayDraw, (unsigned long long)available);
+                }
+                D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition={replay.replayColor.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,read,D3D12_RESOURCE_STATE_RENDER_TARGET};C().list->ResourceBarrier(1,&barrier);
+                const auto rtv=replay.privatePairRtv->GetCPUDescriptorHandleForHeapStart();const auto dsv=replay.privatePairDsv->GetCPUDescriptorHandleForHeapStart();
+                C().list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
+                const D3D12_VIEWPORT outVp{0,0,float(OutputWidth()),float(OutputHeight()),vp.MinDepth,vp.MaxDepth};
+                C().list->RSSetViewports(1,&outVp);C().list->RSSetScissorRects(1,&outScissor);
+                if (countSamples) C().list->BeginQuery(replay.privateSamples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,1);
+                issue();
+                if (countSamples) {
+                    C().list->EndQuery(replay.privateSamples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,1);
+                    C().list->ResolveQueryData(replay.privateSamples.heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,0,2,
+                                               replay.privateSamples.readback.Get(),0);
+                    replay.privateSamples.resolved=true;
+                }
+                C().list->OMSetRenderTargets(1,&C().rtv,FALSE,&C().dsv);C().list->RSSetViewports(1,&vp);C().list->RSSetScissorRects(1,&hostScissor);
+                barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;barrier.Transition.StateAfter=read;C().list->ResourceBarrier(1,&barrier);
+                queued=replay.privatePairClearReadback.Record(g_r.device,C().list->Real(),C().color.Get(),C().depth.Get(),replay.replayColor.Get(),replay.replayDepth.Get(),
+                    replay.replayWidth,replay.replayHeight,OutputWidth(),OutputHeight(),g_r.frame,
+                    PrivatePairReadback::kMaxBytes-replay.privatePairReadback.bytes-replay.privateDrawColorBefore.bytes-
+                    (countSamples ? PrivatePassedSamples::kBytes : 0));
+                if (queued && replay.privateDrawColorBefore.buffer)
+                    replay.privateDrawColorBefore.pairedAfter = replay.privatePairClearReadback.buffer.Get();
+            }
+            Log("private pair draw replay: frame=%llu valid=%u queued=%u bytes=%llu (isolated next draw; no adoption)",
+                (unsigned long long)g_r.frame,unsigned(valid),unsigned(queued),(unsigned long long)replay.privatePairClearReadback.bytes);
+        }
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -10781,9 +12013,12 @@ void BenchmarkWriteReport(const char* path)
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    if (regpu::loaded_counts::Enabled()) regpu::loaded_counts::Begin(frameNumber);
     const auto t0 = std::chrono::steady_clock::now();
     RendererOnSwapImpl(frameNumber, frontBuffer);
     const auto now = std::chrono::steady_clock::now();
+    if (regpu::loaded_counts::Enabled())
+        regpu::loaded_counts::End(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()));
     g_perf.swapSeconds += std::chrono::duration<double>(now - t0).count();
     g_perf.frames++;
     static LiveSwitch perf("REGPU_PERF");
@@ -11243,6 +12478,22 @@ void PrecompileAll()
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    if (ConvertedOutput::Requested() && !C().worker) Frame().converted.Cancel();
+    if (StockPostResolve::Enabled() && !C().worker) {
+        g_stockPost.Finish("frame_ended");
+        if (g_r.frame==1980 || g_r.frame==4980)
+            Log("borrowed RTV timing checkpoint: frame=%llu retired=%llu",g_r.frame,g_recurringRtv.retired);
+        if (!g_stockPost.done && g_r.frame==StockPostResolve::last) {
+            g_stockPost.done=true;
+            if (ConvertedOutput::RecurringBorrowRequested())
+                Log("converted recurring checkpoint: retired=%llu lastFrame=%llu lastSerial=%llu lastFence=%llu stopped=%u",
+                    g_recurringRtv.retired,g_recurringRtv.frame,g_recurringRtv.serial,g_recurringRtv.fence,
+                    UINT(g_recurringRtv.stopped));
+            Log("stock postresolve complete: first=%llu last=%llu total=%u closed=%u",StockPostResolve::first,
+                StockPostResolve::last,g_stockPost.all,g_stockPost.closed);
+        }
+    }
+    const UINT64 submittedRendererFrame=g_r.frame; // presentation advances g_r.frame before signaling the slot
     if (regpu::GetHost().onSwap)
         regpu::GetHost().onSwap(g_r.frame);
     if (!g_r.ok)
@@ -11252,20 +12503,32 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     BeginFrameIfNeeded();
     // A frame that rendered small but never resolved a scene (a menu): upscale what it shows
     // and stay at full size for a while (menus are drawn sharp at full size).
-    if (g_scenePhase && !g_upscale.switchedThisFrame)
-    {
+    if (const char* pairGate=getenv("REGPU_NATIVE_SCENE_PRIVATE_PAIR_FRAME"); pairGate && *pairGate) {
+        char* end=nullptr; const uint64_t frame=strtoull(pairGate,&end,10);
+        if (frame && end && !*end && frame==g_r.frame)
+            Log("native scene private pair: swap begin rendererFrame=%llu hostFrame=%llu slot=%u explicitFrame=%u phase=%u listOpen=%u front=%08X",(unsigned long long)g_r.frame,(unsigned long long)frameNumber,UINT(&Frame()-g_r.frames),unsigned(g_explicitFrame),unsigned(g_explicitPhase),unsigned(g_r.listOpen),frontBuffer);
+    }
+    bool explicitHold=false;
+    if (g_explicitPhase && !g_upscale.switchedThisFrame) {
+        const bool converted=ConvertExplicitScene(frontBuffer,1);
+        if (!converted) {
+            explicitHold=true; Log("native scene: conversion unavailable; holding presentation and returning to legacy");
+        }
+        g_sceneScale=1.0f;g_scenePhase=false;g_explicitPhase=false;
+        g_upscale.retryFrame=g_r.frame+120;g_upscale.reset=true;
+    } else if (g_scenePhase && !g_upscale.switchedThisFrame) {
         UpscaleResolved(frontBuffer);
         g_sceneScale = 1.0f;
         g_scenePhase = false;
         g_upscale.retryFrame = g_r.frame + 120;
-        g_upscale.reset = true; // the next scene has no usable history
+        g_upscale.reset = true;
     }
     // Show the front buffer the title resolved to; fall back to the render
     // target if it was never resolved.
     ID3D12Resource* image = C().color.Get();
     D3D12_RESOURCE_STATES imageState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     auto it = g_r.resolved.find(frontBuffer);
-    const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
+    const bool fromResolve = !explicitHold && it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
         it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
     ID3D12Resource* graded = nullptr; // the front buffer through the display's gamma table
     if (fromResolve)
@@ -11461,7 +12724,50 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (presenting)
         PresenterPresent();
     Frame().fence = g_r.nextFence++;
-    g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
+    const HRESULT frameSignal=g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
+    if (regpu::loaded_counts::CanSample()) {
+        regpu::loaded_counts::Closed(submittedRendererFrame,Frame().fence,SUCCEEDED(frameSignal),
+            g_recurringRtv.retired,g_recurringRtv.frame,g_recurringRtv.serial,g_recurringRtv.fence,
+            g_recurringRtv.stopped,ConvertedOutput::RecurringBorrowRequested());
+    }
+    if (regpu::accepted_threaded::Enabled() && regpu::accepted_threaded::Current()) {
+        regpu::accepted_threaded::Closed(submittedRendererFrame, Frame().fence, SUCCEEDED(frameSignal),
+            g_recurringRtv.retired, g_recurringRtv.frame, g_recurringRtv.serial,
+            g_recurringRtv.fence, g_recurringRtv.stopped);
+    } else if (regpu::accepted_retirement::Enabled() && regpu::accepted_retirement::Current()) {
+        regpu::accepted_retirement::Closed(submittedRendererFrame, Frame().fence, SUCCEEDED(frameSignal),
+            g_recurringRtv.retired, g_recurringRtv.frame, g_recurringRtv.serial,
+            g_recurringRtv.fence, g_recurringRtv.stopped);
+    }
+    if (ConvertedOutput::Requested()) {
+        auto& lease=Frame().converted;
+        if (lease.state==ConvertedOutput::State::bound && lease.frame==submittedRendererFrame && !lease.fence && !lease.failed) {
+            if (SUCCEEDED(frameSignal)) lease.fence=Frame().fence;
+            else lease.failed=true; // pin all ownership to renderer teardown on an unsignalled submission
+        }
+    }
+    if (StockQueryCensus::DsvDiscovery() && Frame().stockDsv.recorded && Frame().stockDsv.frame==submittedRendererFrame &&
+        !Frame().stockDsv.fence && !Frame().stockDsv.failed) {
+        if (SUCCEEDED(frameSignal)) Frame().stockDsv.fence=Frame().fence;
+        else {
+            Frame().stockDsv.failed=true;
+            Log("stock dsv ordinal2 retired: frame=%llu draw=%llu signalFailed=1 accepted=0",submittedRendererFrame,Frame().stockDsv.draw);
+        }
+    }
+    if(Frame().common.recorded && Frame().common.frame==submittedRendererFrame && !Frame().common.fence && !Frame().common.signalFailed) {
+        if(SUCCEEDED(frameSignal)) Frame().common.fence=Frame().fence;
+        else {
+            Frame().common.signalFailed=true;
+            Log("textured common result: frame=%llu draw=%llu fenceSignalFailed=1 accepted=0",
+                Frame().common.frame,Frame().common.draw);
+        }
+    }
+    if (g_explicitFrame && SUCCEEDED(frameSignal)) {
+        for (unsigned i=0;i<2;i++) if (Frame().explicitSlotActive[i]) {
+            Frame().explicitSlots[i].Submitted(Frame().fence); Frame().explicitSlotActive[i]=false;
+        }
+    }
+    g_explicitFrame=false;
     g_r.listOpen = false;
 
     if (dump)
