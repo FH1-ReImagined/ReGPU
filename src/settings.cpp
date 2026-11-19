@@ -2,6 +2,7 @@
 #include "settings.h"
 
 #include <algorithm>
+#include "regpu/native_scene.h"
 
 #include "debug.h"
 #include "log.h"
@@ -29,6 +30,7 @@ Host& GetHost()
 
 void Start()
 {
+    detail::LockNativeSceneSize();
     g_base = GetHost().base;
     LogStart(); // regpu.log in Config::userDir, now that the host has set it
     DebugServerStart(); // REGPU_DEBUG=1: tools/regpuctl.py drives the running game
